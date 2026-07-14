@@ -28,6 +28,13 @@ class ServiceType(models.Model):
 
     type_name = models.CharField(max_length=150)
 
+    # NEW
+    icon = models.ImageField(
+        upload_to="service_types",
+        blank=True,
+        null=True
+    )
+
     description = models.TextField(blank=True)
 
     price = models.DecimalField(max_digits=10, decimal_places=2)

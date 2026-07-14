@@ -29,6 +29,7 @@ def service_list(request):
             types.append({
                 "id": t.id,
                 "type_name": t.type_name,
+                "icon": request.build_absolute_uri(t.icon.url) if t.icon else "",
                 "price": str(t.price),
                 "duration": t.duration,
                 "description": t.description
