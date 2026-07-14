@@ -24,9 +24,16 @@ def serialize_professional_card(pro, service_type=None, request=None):
     """Short card used in list views (Image 1 / Image 2)."""
     price = None
     if service_type:
+        # A specific service_type filter was applied -> show that exact price
         offering = pro.offerings.filter(service_type=service_type, is_active=True).first()
         if offering:
             price = str(offering.price)
+    else:
+        # No service_type filter applied -> fall back to the professional's
+        # cheapest active offering so price is never left null unnecessarily
+        cheapest = pro.offerings.filter(is_active=True).order_by("price").first()
+        if cheapest:
+            price = str(cheapest.price)
 
     next_available_label = None
     if pro.next_available_date and pro.next_available_time:
@@ -127,6 +134,26 @@ def get_available_slots_for_date(pro, target_date):
         })
     return slots
 
+# ---------------------------------------------------------------------------
+# GET /api/service-types/?service_id=  (sidebar Service filter checkboxes)
+# ---------------------------------------------------------------------------
+
+def service_type_list(request):
+    service_id = request.GET.get("service_id")
+    qs = ServiceType.objects.filter(is_active=True)
+    if service_id:
+        qs = qs.filter(service_id=service_id)
+
+    data = [
+        {"id": st.id, "type_name": st.type_name, "price": str(st.price)}
+        for st in qs.order_by("type_name")
+    ]
+    return JsonResponse({
+        "status": "success",
+        "message": "Service types fetched successfully.",
+        "count": len(data),
+        "data": data,
+    })
 
 # ---------------------------------------------------------------------------
 # GET /api/professionals/?service_id=&service_type_id=&location_id=&area=
@@ -147,7 +174,6 @@ def professional_list(request):
     sort = request.GET.get("sort")  # nearest | top_rated | lowest_price | best_match
     search = request.GET.get("search")
 
-    # professionals = Professional.objects.filter(is_active=True)
     professionals = Professional.objects.filter(is_active=True).select_related("governorate")
 
     if location_id:
@@ -159,11 +185,20 @@ def professional_list(request):
             Q(name__icontains=search) | Q(specialty__icontains=search) | Q(area__icontains=search)
         )
 
-    service_type = None
+    # service_type_id can be a single id ("4") or comma-separated ("4,5,6")
+    # for the multi-select "Service" checkboxes in the filter sidebar.
+    service_type_ids = []
     if service_type_id:
-        service_type = ServiceType.objects.filter(id=service_type_id).first()
-        professionals = professionals.filter(offerings__service_type_id=service_type_id,
-                                              offerings__is_active=True)
+        service_type_ids = [int(x) for x in service_type_id.split(",") if x.strip().isdigit()]
+
+    service_type = None
+    if service_type_ids:
+        if len(service_type_ids) == 1:
+            service_type = ServiceType.objects.filter(id=service_type_ids[0]).first()
+        professionals = professionals.filter(
+            offerings__service_type_id__in=service_type_ids,
+            offerings__is_active=True,
+        )
     elif service_id:
         professionals = professionals.filter(
             offerings__service_type__service_id=service_id,
@@ -183,32 +218,52 @@ def professional_list(request):
         professionals = professionals.filter(next_available_date=timezone.localdate())
     if top_rated in ("1", "true", "True"):
         professionals = professionals.filter(rating__gte=4.8)
+
+    # ---- FIX: min_rating parsed safely (bad values silently ignored) ----
     if min_rating:
-        professionals = professionals.filter(rating__gte=float(min_rating))
+        try:
+            professionals = professionals.filter(rating__gte=float(min_rating))
+        except ValueError:
+            pass
+
+    # ---- FIX: price_min / price_max now work WITHOUT requiring service_type_id ----
     if price_min or price_max:
-        if service_type_id:
-            price_filter = Q(offerings__service_type_id=service_type_id)
-            if price_min:
-                price_filter &= Q(offerings__price__gte=price_min)
-            if price_max:
-                price_filter &= Q(offerings__price__lte=price_max)
-            professionals = professionals.filter(price_filter).distinct()
+        price_filter = Q(offerings__is_active=True)
+        if service_type_ids:
+            price_filter &= Q(offerings__service_type_id__in=service_type_ids)
+        if price_min:
+            try:
+                price_filter &= Q(offerings__price__gte=float(price_min))
+            except ValueError:
+                pass
+        if price_max:
+            try:
+                price_filter &= Q(offerings__price__lte=float(price_max))
+            except ValueError:
+                pass
+        professionals = professionals.filter(price_filter).distinct()
 
     # Sorting
     if sort == "nearest" or nearest in ("1", "true", "True"):
         professionals = professionals.order_by("distance_km")
     elif sort == "top_rated":
         professionals = professionals.order_by("-rating", "-jobs_done")
-    elif sort == "lowest_price" and service_type_id:
-        professionals = professionals.order_by()  # price sort done after fetch (per-offering price)
+    elif sort == "lowest_price":
+        # ---- FIX: lowest_price sort no longer requires service_type_id ----
+        professionals = professionals.order_by()  # actual sort done after fetch (per-offering price)
     else:
         professionals = professionals.order_by("-rating")
 
     professionals = list(professionals)
 
-    if sort == "lowest_price" and service_type_id:
+    if sort == "lowest_price":
         def price_key(p):
-            o = p.offerings.filter(service_type_id=service_type_id, is_active=True).first()
+            if service_type_ids:
+                o = p.offerings.filter(
+                    service_type_id__in=service_type_ids, is_active=True
+                ).order_by("price").first()
+            else:
+                o = p.offerings.filter(is_active=True).order_by("price").first()
             return float(o.price) if o else 999999
         professionals.sort(key=price_key)
 
