@@ -9,4 +9,5 @@ urlpatterns = [
     path('', home),
     path('admin/', admin.site.urls),
     path('api/locations/', include('locations.urls')),
+    path("api/services/", include("services.urls")),
 ]
