@@ -37,7 +37,7 @@ def service_list(request):
         response.append({
             "id": service.id,
             "name": service.name,
-            "icon": service.icon.url if service.icon else "",
+            "icon": request.build_absolute_uri(service.icon.url) if service.icon else "",
             "starting_price": str(service.starting_price),
             "description": service.description,
             "location": {
