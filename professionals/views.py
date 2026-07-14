@@ -46,6 +46,8 @@ def serialize_professional_card(pro, service_type=None, request=None):
         "avatar": request.build_absolute_uri(pro.avatar.url) if (pro.avatar and request) else "",
         "initial": pro.name[0].upper() if pro.name else "",
         "area": pro.area,
+        "governorate_id": pro.governorate_id,
+        "governorate": pro.governorate.name,
         "distance_km": float(pro.distance_km),
         "rating": float(pro.rating),
         "jobs_done": pro.jobs_done,
@@ -145,7 +147,8 @@ def professional_list(request):
     sort = request.GET.get("sort")  # nearest | top_rated | lowest_price | best_match
     search = request.GET.get("search")
 
-    professionals = Professional.objects.filter(is_active=True)
+    # professionals = Professional.objects.filter(is_active=True)
+    professionals = Professional.objects.filter(is_active=True).select_related("governorate")
 
     if location_id:
         professionals = professionals.filter(governorate_id=location_id)
