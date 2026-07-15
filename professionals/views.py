@@ -327,7 +327,7 @@ def professional_list(request):
     response = {
         "status": "success",
         "message": "Professionals fetched successfully.",
-        "search_label": search or (service_type.type_name if service_type else None),
+        "search_label": search or None,
         "counts": {
             "all": count_all,
             "available_today": count_available_today,
