@@ -153,11 +153,21 @@ class Booking(models.Model):
         return f"{self.booking_code} - {self.user_name} -> {self.professional.name}"
 
     def calculate_pricing(self):
-        service_fee = self.service_fee
-        platform_fee = round(service_fee * (self.platform_fee_percent / 100), 3)
-        vat_amount = round((service_fee + platform_fee) * (self.vat_percent / 100), 3)
-        total = service_fee + platform_fee + vat_amount
-        self.platform_fee = platform_fee
-        self.vat_amount = vat_amount
-        self.total_amount = total
-        return total
+      from decimal import Decimal
+    
+      service_fee = self.service_fee
+    
+    # Convert percentages to Decimal and divide by 100
+      platform_fee_percent_decimal = Decimal(str(self.platform_fee_percent)) / Decimal('100')
+      vat_percent_decimal = Decimal(str(self.vat_percent)) / Decimal('100')
+    
+    # Calculate fees using Decimal operations
+      platform_fee = (service_fee * platform_fee_percent_decimal).quantize(Decimal('0.001'))
+      subtotal = service_fee + platform_fee
+      vat_amount = (subtotal * vat_percent_decimal).quantize(Decimal('0.001'))
+      total = service_fee + platform_fee + vat_amount
+    
+      self.platform_fee = platform_fee
+      self.vat_amount = vat_amount
+      self.total_amount = total
+      return total
