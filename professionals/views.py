@@ -67,6 +67,28 @@ def serialize_professional_card(pro, service_type=None, request=None):
     }
 
 
+def build_ai_match_note(pro):
+    """Short per-card AI note, e.g. used inside ai_top_picks cards."""
+    return (
+        f"Highest match score, {pro.cancellations} cancellations, "
+        f"{'available today' if pro.is_available_today else 'not available today'}. "
+        f"Avg wait: {pro.avg_arrival_minutes} min."
+    )
+
+
+def build_ai_summary_note(pro):
+    """Bottom banner note shown under the AI Top Picks panel, e.g.
+    'AI: Mohammed is ideal — highest AC score, 0 cancellations, available today. Avg wait: 22 min.'
+    """
+    first_name = pro.name.split()[0] if pro.name else "This professional"
+    return (
+        f"{first_name} is ideal — highest match score, "
+        f"{pro.cancellations} cancellations, "
+        f"{'available today' if pro.is_available_today else 'not available today'}. "
+        f"Avg wait: {pro.avg_arrival_minutes} min."
+    )
+
+
 def serialize_professional_detail(pro, request=None):
     offerings = pro.offerings.filter(is_active=True).select_related("service_type")
     services_offered = [
@@ -170,7 +192,7 @@ def professional_list(request):
     price_min = request.GET.get("price_min")
     price_max = request.GET.get("price_max")
     search = request.GET.get("search")
-    
+
     # Unified chip selection and sorting rule parameter
     sort = request.GET.get("sort", "").lower()
 
@@ -185,6 +207,8 @@ def professional_list(request):
             Q(name__icontains=search) | Q(specialty__icontains=search) | Q(area__icontains=search)
         )
 
+    # service_type_id can be a single id or a comma-separated list of ids
+    # (used when the user has multiple "Choose a Service" checkboxes selected)
     service_type_ids = []
     if service_type_id:
         service_type_ids = [int(x) for x in service_type_id.split(",") if x.strip().isdigit()]
@@ -205,7 +229,10 @@ def professional_list(request):
 
     professionals = professionals.distinct()
 
-    # Calculate exact Badge counter labels dynamically based on clean requirements
+    # Calculate exact Badge counter labels dynamically based on clean requirements.
+    # NOTE: base_qs is taken AFTER the service_id / service_type_id filter above,
+    # so count_all correctly reflects "pros available" for whatever service(s)
+    # are currently selected on the frontend (e.g. "312 pros available").
     base_qs = professionals
     count_all = base_qs.count()
     count_available_today = base_qs.filter(next_available_date=timezone.localdate()).count()
@@ -267,13 +294,18 @@ def professional_list(request):
 
     cards = [serialize_professional_card(p, service_type, request) for p in professionals]
 
-    # Render top matches
+    # Render top matches (AI Top Picks panel)
     ranked = sorted(professionals, key=lambda p: p.ai_match_score(service_type), reverse=True)[:3]
     ai_top_picks = []
     for idx, p in enumerate(ranked):
         card = serialize_professional_card(p, service_type, request)
         card["is_best"] = idx == 0
+        card["ai_match_note"] = build_ai_match_note(p)
         ai_top_picks.append(card)
+
+    # Bottom AI summary banner, e.g.
+    # "AI: Mohammed is ideal — highest AC score, 0 cancellations, available today. Avg wait: 22 min."
+    ai_summary_note = build_ai_summary_note(ranked[0]) if ranked else None
 
     return JsonResponse({
         "status": "success",
@@ -287,6 +319,7 @@ def professional_list(request):
         },
         "count": len(cards),
         "ai_top_picks": ai_top_picks,
+        "ai_summary_note": ai_summary_note,
         "data": cards,
     })
 
@@ -301,10 +334,42 @@ def professional_detail(request, pk):
     except Professional.DoesNotExist:
         return JsonResponse({"status": "error", "message": "Professional not found."}, status=404)
 
+    data = serialize_professional_detail(pro, request)
+
+    # service_type ids this professional offers -> used to find how many other
+    # pros offer the SAME service(s), and to build the AI Top Picks panel.
+    offered_service_type_ids = list(
+        pro.offerings.filter(is_active=True).values_list("service_type_id", flat=True)
+    )
+
+    pool = Professional.objects.filter(is_active=True).select_related("governorate")
+    if offered_service_type_ids:
+        pool = pool.filter(
+            offerings__service_type_id__in=offered_service_type_ids,
+            offerings__is_active=True,
+        ).distinct()
+
+    pros_available_count = pool.count()
+
+    pool_list = list(pool)
+    ranked = sorted(pool_list, key=lambda p: p.ai_match_score(), reverse=True)[:3]
+    ai_top_picks = []
+    for idx, p in enumerate(ranked):
+        card = serialize_professional_card(p, None, request)
+        card["is_best"] = idx == 0
+        card["ai_match_note"] = build_ai_match_note(p)
+        ai_top_picks.append(card)
+
+    ai_summary_note = build_ai_summary_note(ranked[0]) if ranked else None
+
+    data["pros_available_count"] = pros_available_count
+    data["ai_top_picks"] = ai_top_picks
+    data["ai_summary_note"] = ai_summary_note
+
     return JsonResponse({
         "status": "success",
         "message": "Professional fetched successfully.",
-        "data": serialize_professional_detail(pro, request),
+        "data": data,
     })
 
 
