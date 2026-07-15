@@ -3,7 +3,6 @@ import json
 import random
 import string
 
-from django.db import models
 from django.db.models import Q
 from django.http import JsonResponse
 from django.utils import timezone
@@ -203,10 +202,7 @@ def professional_list(request):
     service_type_id = request.GET.get("service_type_id")
     location_id = request.GET.get("location_id")
     area = request.GET.get("area")
-    
-    # CHANGED: Switched from 'min_rating' to 'rating' query parameter parameter input
-    rating_param = request.GET.get("rating")
-    
+    min_rating_param = request.GET.get("rating")
     price_min = request.GET.get("price_min")
     price_max = request.GET.get("price_max")
     search = request.GET.get("search")
@@ -257,17 +253,21 @@ def professional_list(request):
     count_top_rated = base_qs.filter(rating__gte=4.5).count()  # Displays high ratings count
     count_nearest = base_qs.filter(distance_km__lte=5.0).count()
 
-    # Chip Filtering Logic handling both direct subsets and sort updates
+    # Chip Filtering Logic handling both direct subsets and sort updates.
+    # This must run BEFORE list(professionals) below, since .filter() only
+    # works on querysets, not on plain Python lists.
     if sort == "available_today":
         professionals = professionals.filter(next_available_date=timezone.localdate())
     elif sort == "top_rated":
         professionals = professionals.filter(rating__gte=4.5)
+    elif sort == "nearest":
+        professionals = professionals.filter(distance_km__lte=5.0)
 
     # Secondary Filter overrides (Sidebar parameters)
-    # CHANGED: Checks against the exact rating parameter and applies exact matching condition (rating=...)
-    if rating_param:
+    # exact match on rating (e.g. ?rating=4.9)
+    if min_rating_param:
         try:
-            professionals = professionals.filter(rating=float(rating_param))
+            professionals = professionals.filter(rating=float(min_rating_param))
         except ValueError:
             pass
 
@@ -287,20 +287,19 @@ def professional_list(request):
                 pass
         professionals = professionals.filter(price_filter).distinct()
 
-    # Order processing depending on current sorting chip
-    if sort == "nearest":
-        professionals = professionals.order_by("distance_km")
-    elif sort == "top_rated":
-        professionals = professionals.order_by("-rating", "-jobs_done")
-    elif sort == "lowest_price":
-        professionals = professionals.order_by()  # Handled below in memory
-    else:
-        professionals = professionals.order_by("-rating")
-
+    # Order processing depending on current sorting chip.
+    # NOTE: sorting is done in Python (not via .order_by() on the queryset) because
+    # the queryset already has .distinct() applied from the service_type_id join filter.
+    # Combining .distinct() with .order_by() on a different field is unreliable across
+    # databases (e.g. Postgres requires ORDER BY fields to match DISTINCT fields) — this
+    # was why "nearest" and "lowest_price" sometimes silently ignored the requested order.
     professionals = list(professionals)
 
-    # Sort matching lowest price per selection criteria
-    if sort == "lowest_price":
+    if sort == "nearest":
+        professionals.sort(key=lambda p: float(p.distance_km))
+    elif sort == "top_rated":
+        professionals.sort(key=lambda p: (-float(p.rating), -p.jobs_done))
+    elif sort == "lowest_price":
         def price_key(p):
             if service_type_ids:
                 o = p.offerings.filter(
@@ -310,6 +309,8 @@ def professional_list(request):
                 o = p.offerings.filter(is_active=True).order_by("price").first()
             return float(o.price) if o else 999999
         professionals.sort(key=price_key)
+    else:
+        professionals.sort(key=lambda p: -float(p.rating))
 
     cards = [
         serialize_professional_card(p, service_type, request, service_type_ids)
@@ -382,7 +383,6 @@ def professional_list(request):
                 "service_id": service_id,
                 "service_type_id_raw": service_type_id,
                 "service_type_ids_parsed": service_type_ids,
-                "rating_param": rating_param,
             },
             "raw_offering_rows_matched": len(all_offerings),
             "distinct_professionals_in_offerings": len(pro_ids_in_offerings),
@@ -405,7 +405,8 @@ def professional_detail(request, pk):
 
     data = serialize_professional_detail(pro, request)
 
-    # service_type ids this professional offers
+    # service_type ids this professional offers -> used to find how many other
+    # pros offer the SAME service(s), and to build the AI Top Picks panel.
     offered_service_type_ids = list(
         pro.offerings.filter(is_active=True).values_list("service_type_id", flat=True)
     )
