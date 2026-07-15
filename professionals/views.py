@@ -1,10 +1,12 @@
-import json
 from datetime import datetime, timedelta, date as date_cls
+import json
+import random
+import string
 
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
-from django.utils import timezone
 from django.db.models import Q
+from django.http import JsonResponse
+from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
 
 from services.models import Service, ServiceType
 from .models import Professional, ProfessionalServiceType, Review, Booking
@@ -135,7 +137,7 @@ def get_available_slots_for_date(pro, target_date):
     return slots
 
 # ---------------------------------------------------------------------------
-# GET /api/service-types/?service_id=  (sidebar Service filter checkboxes)
+# GET /api/service-types/?service_id=
 # ---------------------------------------------------------------------------
 
 def service_type_list(request):
@@ -156,8 +158,7 @@ def service_type_list(request):
     })
 
 # ---------------------------------------------------------------------------
-# GET /api/professionals/?service_id=&service_type_id=&location_id=&area=
-#     &available_today=true&min_rating=4&price_max=30&price_min=0&sort=nearest
+# GET /api/professionals/
 # ---------------------------------------------------------------------------
 
 def professional_list(request):
@@ -165,14 +166,13 @@ def professional_list(request):
     service_type_id = request.GET.get("service_type_id")
     location_id = request.GET.get("location_id")
     area = request.GET.get("area")
-    available_today = request.GET.get("available_today")
-    top_rated = request.GET.get("top_rated")  # true -> rating >= 4.8
-    nearest = request.GET.get("nearest")      # true -> just sorts, real "nearest(N)" count uses sort
-    min_rating = request.GET.get("min_rating")
+    min_rating_param = request.GET.get("min_rating")
     price_min = request.GET.get("price_min")
     price_max = request.GET.get("price_max")
-    sort = request.GET.get("sort")  # nearest | top_rated | lowest_price | best_match
     search = request.GET.get("search")
+    
+    # Unified chip selection and sorting rule parameter
+    sort = request.GET.get("sort", "").lower()
 
     professionals = Professional.objects.filter(is_active=True).select_related("governorate")
 
@@ -185,8 +185,6 @@ def professional_list(request):
             Q(name__icontains=search) | Q(specialty__icontains=search) | Q(area__icontains=search)
         )
 
-    # service_type_id can be a single id ("4") or comma-separated ("4,5,6")
-    # for the multi-select "Service" checkboxes in the filter sidebar.
     service_type_ids = []
     if service_type_id:
         service_type_ids = [int(x) for x in service_type_id.split(",") if x.strip().isdigit()]
@@ -207,26 +205,26 @@ def professional_list(request):
 
     professionals = professionals.distinct()
 
-    # Counts BEFORE narrowing filters further (for filter chip counts)
+    # Calculate exact Badge counter labels dynamically based on clean requirements
     base_qs = professionals
     count_all = base_qs.count()
     count_available_today = base_qs.filter(next_available_date=timezone.localdate()).count()
-    count_top_rated = base_qs.filter(rating__gte=4.8).count()
-    count_nearest = base_qs.filter(distance_km__lte=2).count()
+    count_top_rated = base_qs.filter(rating__gte=4.5).count()  # Displays high ratings count
+    count_nearest = base_qs.filter(distance_km__lte=5.0).count()
 
-    if available_today in ("1", "true", "True"):
+    # Chip Filtering Logic handling both direct subsets and sort updates
+    if sort == "available_today":
         professionals = professionals.filter(next_available_date=timezone.localdate())
-    if top_rated in ("1", "true", "True"):
-        professionals = professionals.filter(rating__gte=4.8)
+    elif sort == "top_rated":
+        professionals = professionals.filter(rating__gte=4.5)
 
-    # ---- FIX: min_rating parsed safely (bad values silently ignored) ----
-    if min_rating:
+    # Secondary Filter overrides (Sidebar parameters)
+    if min_rating_param:
         try:
-            professionals = professionals.filter(rating__gte=float(min_rating))
+            professionals = professionals.filter(rating__gte=float(min_rating_param))
         except ValueError:
             pass
 
-    # ---- FIX: price_min / price_max now work WITHOUT requiring service_type_id ----
     if price_min or price_max:
         price_filter = Q(offerings__is_active=True)
         if service_type_ids:
@@ -243,19 +241,19 @@ def professional_list(request):
                 pass
         professionals = professionals.filter(price_filter).distinct()
 
-    # Sorting
-    if sort == "nearest" or nearest in ("1", "true", "True"):
+    # Order processing depending on current sorting chip
+    if sort == "nearest":
         professionals = professionals.order_by("distance_km")
     elif sort == "top_rated":
         professionals = professionals.order_by("-rating", "-jobs_done")
     elif sort == "lowest_price":
-        # ---- FIX: lowest_price sort no longer requires service_type_id ----
-        professionals = professionals.order_by()  # actual sort done after fetch (per-offering price)
+        professionals = professionals.order_by()  # Handled below in memory
     else:
         professionals = professionals.order_by("-rating")
 
     professionals = list(professionals)
 
+    # Sort matching lowest price per selection criteria
     if sort == "lowest_price":
         def price_key(p):
             if service_type_ids:
@@ -269,7 +267,7 @@ def professional_list(request):
 
     cards = [serialize_professional_card(p, service_type, request) for p in professionals]
 
-    # AI Top Picks: top 3 by ai_match_score
+    # Render top matches
     ranked = sorted(professionals, key=lambda p: p.ai_match_score(service_type), reverse=True)[:3]
     ai_top_picks = []
     for idx, p in enumerate(ranked):
@@ -311,7 +309,7 @@ def professional_detail(request, pk):
 
 
 # ---------------------------------------------------------------------------
-# GET /api/professionals/<id>/slots/?date=YYYY-MM-DD  (or ?days=4 to get next N days)
+# GET /api/professionals/<id>/slots/
 # ---------------------------------------------------------------------------
 
 def professional_slots(request, pk):
@@ -338,7 +336,6 @@ def professional_slots(request, pk):
             },
         })
 
-    # Return next N days with slots (used to render the date picker, Image 4)
     days = int(days_param) if days_param else 6
     today = timezone.localdate()
     result = []
@@ -360,8 +357,7 @@ def professional_slots(request, pk):
 
 
 # ---------------------------------------------------------------------------
-# GET /api/locations/<governorate_id>/areas/?service_id=  (Image 5 area chips)
-# Simple hard-coded-per-professional areas derived from Professional.area values
+# GET /api/professionals/areas/
 # ---------------------------------------------------------------------------
 
 def area_list(request):
@@ -380,24 +376,6 @@ def area_list(request):
 
 # ---------------------------------------------------------------------------
 # POST /api/bookings/create/
-# Body (JSON):
-# {
-#   "professional_id": 1,
-#   "service_type_id": 4,
-#   "booking_date": "2026-07-09",
-#   "booking_time": "10:00",
-#   "user_name": "Ahmed",
-#   "user_email": "ahmed@example.com",
-#   "user_mobile": "+968 9234 5678",
-#   "area": "Qurum",
-#   "villa_apartment_no": "Villa 12",
-#   "street_name": "Al Noor Street",
-#   "building_floor": "Ground Floor",
-#   "nearest_landmark": "Near Al Qurum Park",
-#   "payment_method": "bank_of_muscat_card",
-#   "card_last4": "4521",
-#   "save_card": true
-# }
 # ---------------------------------------------------------------------------
 
 @csrf_exempt
@@ -446,7 +424,6 @@ def booking_create(request):
             "message": "Invalid date/time format. Use booking_date=YYYY-MM-DD, booking_time=HH:MM.",
         }, status=400)
 
-    # Prevent double-booking the same slot
     clash = Booking.objects.filter(
         professional=pro,
         booking_date=booking_date,
@@ -551,7 +528,6 @@ def booking_detail(request, pk):
 
 # ---------------------------------------------------------------------------
 # POST /api/bookings/<id>/confirm/
-# Marks booking confirmed (this is the final "Confirm & Pay" step, Image 6 -> 7)
 # ---------------------------------------------------------------------------
 
 @csrf_exempt
