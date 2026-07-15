@@ -3,6 +3,7 @@ import json
 import random
 import string
 
+from django.db import models
 from django.db.models import Q
 from django.http import JsonResponse
 from django.utils import timezone
@@ -202,7 +203,10 @@ def professional_list(request):
     service_type_id = request.GET.get("service_type_id")
     location_id = request.GET.get("location_id")
     area = request.GET.get("area")
-    min_rating_param = request.GET.get("min_rating")
+    
+    # CHANGED: Switched from 'min_rating' to 'rating' query parameter parameter input
+    rating_param = request.GET.get("rating")
+    
     price_min = request.GET.get("price_min")
     price_max = request.GET.get("price_max")
     search = request.GET.get("search")
@@ -260,9 +264,10 @@ def professional_list(request):
         professionals = professionals.filter(rating__gte=4.5)
 
     # Secondary Filter overrides (Sidebar parameters)
-    if min_rating_param:
+    # CHANGED: Checks against the exact rating parameter and applies exact matching condition (rating=...)
+    if rating_param:
         try:
-            professionals = professionals.filter(rating__gte=float(min_rating_param))
+            professionals = professionals.filter(rating=float(rating_param))
         except ValueError:
             pass
 
@@ -341,9 +346,6 @@ def professional_list(request):
     }
 
     # Optional diagnostics: ?debug=1
-    # Helps trace mismatches like "raw SQL shows 6 rows but API returns 2" by showing
-    # exactly which filter was applied and why rows may have been excluded
-    # (inactive professional vs inactive offering row).
     if request.GET.get("debug") == "1":
         all_offerings = []
         if service_type_ids:
@@ -380,6 +382,7 @@ def professional_list(request):
                 "service_id": service_id,
                 "service_type_id_raw": service_type_id,
                 "service_type_ids_parsed": service_type_ids,
+                "rating_param": rating_param,
             },
             "raw_offering_rows_matched": len(all_offerings),
             "distinct_professionals_in_offerings": len(pro_ids_in_offerings),
@@ -402,8 +405,7 @@ def professional_detail(request, pk):
 
     data = serialize_professional_detail(pro, request)
 
-    # service_type ids this professional offers -> used to find how many other
-    # pros offer the SAME service(s), and to build the AI Top Picks panel.
+    # service_type ids this professional offers
     offered_service_type_ids = list(
         pro.offerings.filter(is_active=True).values_list("service_type_id", flat=True)
     )
