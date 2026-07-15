@@ -22,20 +22,33 @@ WORKING_HOURS = [
 ]
 
 
-def serialize_professional_card(pro, service_type=None, request=None):
+def serialize_professional_card(pro, service_type=None, request=None, service_type_ids=None):
     """Short card used in list views (Image 1 / Image 2)."""
     price = None
+    matched_service_type_id = None
+
     if service_type:
-        # A specific service_type filter was applied -> show that exact price
+        # A single specific service_type filter was applied -> show that exact price
         offering = pro.offerings.filter(service_type=service_type, is_active=True).first()
         if offering:
             price = str(offering.price)
+            matched_service_type_id = offering.service_type_id
+    elif service_type_ids:
+        # Multiple service_type ids were selected (checkboxes) -> show the cheapest
+        # matching offering among the selected ones, and which service_type it belongs to
+        offering = pro.offerings.filter(
+            service_type_id__in=service_type_ids, is_active=True
+        ).order_by("price").first()
+        if offering:
+            price = str(offering.price)
+            matched_service_type_id = offering.service_type_id
     else:
         # No service_type filter applied -> fall back to the professional's
         # cheapest active offering so price is never left null unnecessarily
         cheapest = pro.offerings.filter(is_active=True).order_by("price").first()
         if cheapest:
             price = str(cheapest.price)
+            matched_service_type_id = cheapest.service_type_id
 
     next_available_label = None
     if pro.next_available_date and pro.next_available_time:
@@ -62,6 +75,7 @@ def serialize_professional_card(pro, service_type=None, request=None):
         "jobs_done": pro.jobs_done,
         "next_available": next_available_label,
         "is_available_today": pro.is_available_today,
+        "service_type_id": matched_service_type_id,
         "price": price,
         "ai_match_score": pro.ai_match_score(service_type),
     }
@@ -292,13 +306,16 @@ def professional_list(request):
             return float(o.price) if o else 999999
         professionals.sort(key=price_key)
 
-    cards = [serialize_professional_card(p, service_type, request) for p in professionals]
+    cards = [
+        serialize_professional_card(p, service_type, request, service_type_ids)
+        for p in professionals
+    ]
 
     # Render top matches (AI Top Picks panel)
     ranked = sorted(professionals, key=lambda p: p.ai_match_score(service_type), reverse=True)[:3]
     ai_top_picks = []
     for idx, p in enumerate(ranked):
-        card = serialize_professional_card(p, service_type, request)
+        card = serialize_professional_card(p, service_type, request, service_type_ids)
         card["is_best"] = idx == 0
         card["ai_match_note"] = build_ai_match_note(p)
         ai_top_picks.append(card)
@@ -307,7 +324,7 @@ def professional_list(request):
     # "AI: Mohammed is ideal — highest AC score, 0 cancellations, available today. Avg wait: 22 min."
     ai_summary_note = build_ai_summary_note(ranked[0]) if ranked else None
 
-    return JsonResponse({
+    response = {
         "status": "success",
         "message": "Professionals fetched successfully.",
         "search_label": search or (service_type.type_name if service_type else None),
@@ -321,7 +338,56 @@ def professional_list(request):
         "ai_top_picks": ai_top_picks,
         "ai_summary_note": ai_summary_note,
         "data": cards,
-    })
+    }
+
+    # Optional diagnostics: ?debug=1
+    # Helps trace mismatches like "raw SQL shows 6 rows but API returns 2" by showing
+    # exactly which filter was applied and why rows may have been excluded
+    # (inactive professional vs inactive offering row).
+    if request.GET.get("debug") == "1":
+        all_offerings = []
+        if service_type_ids:
+            all_offerings = list(
+                ProfessionalServiceType.objects.filter(
+                    service_type_id__in=service_type_ids
+                ).values("professional_id", "service_type_id", "is_active")
+            )
+        elif service_id:
+            all_offerings = list(
+                ProfessionalServiceType.objects.filter(
+                    service_type__service_id=service_id
+                ).values("professional_id", "service_type_id", "is_active")
+            )
+
+        pro_ids_in_offerings = {o["professional_id"] for o in all_offerings}
+        pro_active_map = dict(
+            Professional.objects.filter(id__in=pro_ids_in_offerings).values_list("id", "is_active")
+        )
+
+        excluded = []
+        for o in all_offerings:
+            pid = o["professional_id"]
+            pro_is_active = pro_active_map.get(pid)
+            if pro_is_active is False:
+                excluded.append({**o, "reason": "professional.is_active = False"})
+            elif not o["is_active"]:
+                excluded.append({**o, "reason": "offering.is_active = False"})
+            elif pro_is_active is None:
+                excluded.append({**o, "reason": "professional not found (deleted?)"})
+
+        response["debug"] = {
+            "filters_received": {
+                "service_id": service_id,
+                "service_type_id_raw": service_type_id,
+                "service_type_ids_parsed": service_type_ids,
+            },
+            "raw_offering_rows_matched": len(all_offerings),
+            "distinct_professionals_in_offerings": len(pro_ids_in_offerings),
+            "final_count_returned": count_all,
+            "excluded_rows": excluded,
+        }
+
+    return JsonResponse(response)
 
 
 # ---------------------------------------------------------------------------
@@ -355,7 +421,7 @@ def professional_detail(request, pk):
     ranked = sorted(pool_list, key=lambda p: p.ai_match_score(), reverse=True)[:3]
     ai_top_picks = []
     for idx, p in enumerate(ranked):
-        card = serialize_professional_card(p, None, request)
+        card = serialize_professional_card(p, None, request, offered_service_type_ids)
         card["is_best"] = idx == 0
         card["ai_match_note"] = build_ai_match_note(p)
         ai_top_picks.append(card)
