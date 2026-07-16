@@ -9,8 +9,8 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 
 from services.models import Service, ServiceType
+from services.models import Booking as ServiceBooking  # Imported for auto-syncing
 from .models import Professional, ProfessionalServiceType, Review, Booking
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -507,9 +507,8 @@ def area_list(request):
         "data": areas,
     })
 
-
 # ---------------------------------------------------------------------------
-# POST /api/bookings/create/
+# POST /api/bookings/create/ (Sync Integrated Natively Here)
 # ---------------------------------------------------------------------------
 
 @csrf_exempt
@@ -567,6 +566,7 @@ def booking_create(request):
     if clash:
         return JsonResponse({"status": "error", "message": "This time slot is no longer available."}, status=409)
 
+    # 1. Save booking in the professional app
     booking = Booking(
         user_name=payload["user_name"],
         user_email=payload["user_email"],
@@ -589,6 +589,30 @@ def booking_create(request):
     )
     booking.calculate_pricing()
     booking.save()
+
+    # 2. AUTO-SYNC: Mirror record completely into the services app booking table
+    from django.utils.timezone import make_aware
+
+    combined_datetime = datetime.combine(booking.booking_date, booking.booking_time)
+    if combined_datetime.tzinfo is None:
+        combined_datetime = make_aware(combined_datetime)
+
+    ServiceBooking.objects.create(
+        booking_number=booking.booking_code,
+        user_id=1,  # Standard architectural fallback profile ID map
+        service_type=booking.service_type,
+        professional_id=booking.professional.id,
+        scheduled_at=combined_datetime,
+        duration_minutes=45,
+        location_name=booking.area,
+        address=f"{booking.villa_apartment_no}, {booking.street_name}, {booking.nearest_landmark}".strip(', '),
+        status=booking.status.upper(),
+        service_fee=booking.service_fee,
+        platform_fee=booking.platform_fee,
+        vat=booking.vat_amount,
+        total_paid=booking.total_amount,
+        payment_method=booking.get_payment_method_display()
+    )
 
     return JsonResponse({
         "status": "success",

@@ -109,6 +109,17 @@ def service_list(request):
             "service_types": types,
             "search_match": "main_category" if search_query and search_query.lower() in service.name.lower() else ("service_type" if search_query and types else None)
         })
+        return JsonResponse({
+        "status": "success",
+        "message": "Services fetched successfully." + (f" Search results for: '{search_query}'" if search_query else ""),
+        "count": len(response),
+        "search_query": search_query if search_query else None,
+        "filters": {
+            "location_id": location_id if location_id else None,
+            "service_id": service_id if service_id else None
+        },
+        "data": response
+    })
 # 2. BOOKINGS AGGREGATION FILTER (Upcoming, Ongoing, Completed, Cancelled)
 @login_required
 def my_bookings(request):
