@@ -1,5 +1,4 @@
 from django.urls import path
-from .views import service_list
 from .views import (
     service_list, 
     my_bookings, 
@@ -10,7 +9,7 @@ from .views import (
 )
 
 urlpatterns = [
-    path("", service_list),
+    path("", service_list, name="service_list"),
     path("bookings/", my_bookings, name="my_bookings_list"),
     path("bookings/<int:booking_id>/track/", track_booking, name="track_booking_live"),
     path("bookings/<int:booking_id>/rate/", rate_booking, name="rate_booking_review"),
