@@ -46,6 +46,13 @@ INSTALLED_APPS = [
     'professionals',
 ]
 
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.TokenAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
+    ],
+}
+
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
@@ -55,9 +62,22 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'corsheaders.middleware.CorsMiddleware', 
 ]
 
 CORS_ALLOW_ALL_ORIGINS = True  # For development only
+
+# OTP settings
+OTP_EXPIRY_MINUTES = 5
+OTP_LENGTH = 6
+
+# SMS configuration (using Twilio)
+TWILIO_ACCOUNT_SID = 'your_twilio_account_sid'
+TWILIO_AUTH_TOKEN = 'your_twilio_auth_token'
+TWILIO_PHONE_NUMBER = '+1234567890'  # Your Twilio number
+
+# For testing without Twilio, set this to True
+SMS_DEBUG_MODE = True  # If True, prints OTP to console instead of sending SMS
 
 # OR for more specific configuration:
 CORS_ALLOWED_ORIGINS = [
