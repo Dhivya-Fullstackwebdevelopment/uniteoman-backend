@@ -22,5 +22,6 @@ urlpatterns = [
 
     path("bookings/<int:pk>/confirm/", views.booking_confirm),
 
-    path("bookings/<int:pk>/cancel/", views.booking_cancel),
+    # path("bookings/<int:pk>/cancel/", views.booking_cancel),
+    path("bookings/<int:service_booking_id>/cancel/", views.service_booking_cancel),
 ]

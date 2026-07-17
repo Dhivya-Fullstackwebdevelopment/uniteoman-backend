@@ -15,6 +15,7 @@ from rest_framework.decorators import api_view, authentication_classes, permissi
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.authentication import JWTAuthentication
+from services.models import Booking as ServiceBooking
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -743,26 +744,38 @@ def booking_confirm(request, pk):
 # ---------------------------------------------------------------------------
 
 @csrf_exempt
-def booking_cancel(request, pk):
+def service_booking_cancel(request, service_booking_id):
     if request.method != "POST":
         return JsonResponse({"status": "error", "message": "POST required."}, status=405)
 
     try:
-        booking = Booking.objects.get(pk=pk)
-    except Booking.DoesNotExist:
-        return JsonResponse({"status": "error", "message": "Booking not found."}, status=404)
+        service_booking = ServiceBooking.objects.get(pk=service_booking_id)
+    except ServiceBooking.DoesNotExist:
+        return JsonResponse({"status": "error", "message": "Service booking not found."}, status=404)
 
-    if booking.status in (Booking.STATUS_CANCELLED, Booking.STATUS_COMPLETED):
+    if service_booking.status == "CANCELLED":
         return JsonResponse({
             "status": "error",
-            "message": f"Booking already {booking.status}.",
+            "message": "Booking already cancelled.",
         }, status=400)
 
-    booking.status = Booking.STATUS_CANCELLED
-    booking.save(update_fields=["status", "updated_at"])
+    # find matching professionals.Booking using booking_number <-> booking_code
+    pro_booking = Booking.objects.filter(booking_code=service_booking.booking_number).first()
+
+    if pro_booking:
+        if pro_booking.status not in (Booking.STATUS_CANCELLED, Booking.STATUS_COMPLETED):
+            pro_booking.status = Booking.STATUS_CANCELLED
+            pro_booking.save(update_fields=["status", "updated_at"])
+
+    service_booking.status = "CANCELLED"
+    service_booking.save(update_fields=["status"])
 
     return JsonResponse({
         "status": "success",
         "message": "Booking cancelled.",
-        "data": serialize_booking(booking, request),
+        "data": {
+            "service_booking_id": service_booking.id,
+            "booking_number": service_booking.booking_number,
+            "status": service_booking.status,
+        },
     })
