@@ -19,6 +19,7 @@ from services.models import Booking as ServiceBooking
 from professionals.models import Booking as ProBooking
 from django.shortcuts import get_object_or_404 
 from django.db import transaction
+from django.utils.timezone import make_aware, is_naive
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -917,4 +918,43 @@ def reschedule_booking(request, service_booking_id):
             "new_scheduled_at": service_booking.scheduled_at.strftime('%Y-%m-%d %H:%M'),
             "status": service_booking.status
         }
+    }, status=200)
+
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def booking_book_again(request, service_booking_id):
+    """
+    Reactivates a cancelled booking by flipping its status back to PENDING.
+    Does not create a new booking record.
+    """
+    # 1. Fetch the cancelled service booking (must belong to this user)
+    service_booking = get_object_or_404(ServiceBooking, id=service_booking_id, user=request.user)
+
+    if service_booking.status != "CANCELLED":
+        return Response({
+            "status": "error",
+            "message": "Only cancelled bookings can be booked again."
+        }, status=400)
+
+    # 2. Find the matching professional-app booking record
+    pro_booking = ProBooking.objects.filter(booking_code=service_booking.booking_number).first()
+    if not pro_booking:
+        return Response({
+            "status": "error",
+            "message": "Associated professional booking record could not be found."
+        }, status=404)
+
+    # 3. Atomically flip both records back to pending
+    with transaction.atomic():
+        pro_booking.status = ProBooking.STATUS_PENDING
+        pro_booking.save(update_fields=["status", "updated_at"])
+
+        service_booking.status = "PENDING"
+        service_booking.save(update_fields=["status"])
+
+    return Response({
+        "status": "success",
+        "message": "Booking reactivated and set to pending.",
+        "data": serialize_booking(pro_booking, request),
     }, status=200)
