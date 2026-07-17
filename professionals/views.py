@@ -15,7 +15,6 @@ from rest_framework.decorators import api_view, authentication_classes, permissi
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.authentication import JWTAuthentication
-from services.models import Booking as ServiceBooking
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -560,15 +559,49 @@ def booking_create(request):
             "message": "Invalid date/time format. Use booking_date=YYYY-MM-DD, booking_time=HH:MM.",
         }, status=400)
 
+ # ---------------------------------------------------------------------------
+    # 1. Check for absolute Professional Availability (Clash Check)
+    # ---------------------------------------------------------------------------
     clash = Booking.objects.filter(
         professional=pro,
         booking_date=booking_date,
         booking_time=booking_time,
         status__in=[Booking.STATUS_PENDING, Booking.STATUS_CONFIRMED],
     ).exists()
+    
     if clash:
-        return Response({"status": "error", "message": "This time slot is no longer available."}, status=409)
+        return Response({
+            "status": "error",
+            "message": f"{pro.name} is already booked at {booking_time.strftime('%I:%M %p').lstrip('0')} on this date. Please pick another time slot."
+        }, status=409)
 
+    # ---------------------------------------------------------------------------
+    # 2. Duplicate-booking guard (User already has a booking here)
+    # ---------------------------------------------------------------------------
+    from django.utils.timezone import make_aware, is_naive
+    from services.models import Booking as ServiceBooking
+
+
+    combined_dt = datetime.combine(booking_date, booking_time)
+    if is_naive(combined_dt):
+        combined_dt = make_aware(combined_dt)
+
+    duplicate_booking = ServiceBooking.objects.filter(
+        user_id=request.user.id,
+        scheduled_at=combined_dt,
+    ).exclude(status__in=["CANCELLED", "COMPLETED"]).first()
+
+    if duplicate_booking:
+        existing_local_dt = timezone.localtime(duplicate_booking.scheduled_at)
+        return Response({
+            "status": "error",
+            "message": (
+                f"You have already booked a service on "
+                f"{existing_local_dt.strftime('%d %b %Y')} at "
+                f"{existing_local_dt.strftime('%I:%M %p').lstrip('0')}. "
+                f"Please choose a different time slot."
+            ),
+        }, status=409)
     # 1. Save booking in the professional app
     booking = Booking(
         user_name=payload["user_name"],
