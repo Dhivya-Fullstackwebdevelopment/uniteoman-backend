@@ -39,10 +39,16 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'corsheaders',  
+    'rest_framework',  
     'accounts',
     'locations',
     'services',
     'professionals',
+]
+
+AUTHENTICATION_BACKENDS = [
+    'accounts.backends.MobileNumberBackend',
+    'django.contrib.auth.backends.ModelBackend',
 ]
 
 REST_FRAMEWORK = {
