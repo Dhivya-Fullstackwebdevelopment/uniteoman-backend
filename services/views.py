@@ -315,7 +315,6 @@ def download_receipt_pdf(request, booking_id):
         from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib import colors
-        from reportlab.lib.units import inch
     except ImportError:
         return JsonResponse({
             "status": "error",
@@ -327,17 +326,29 @@ def download_receipt_pdf(request, booking_id):
     story = []
 
     styles = getSampleStyleSheet()
+    
+    # Title style configured explicitly with center alignment (alignment=1)
     title_style = ParagraphStyle(
-        'Title',
+        'CenteredTitle',
         parent=styles['Heading1'],
         textColor=colors.HexColor('#9C27B0'),
-        fontSize=24,
+        fontSize=26,
+        alignment=1,        # 0 = Left, 1 = Center, 2 = Right
+        spaceAfter=10
+    )
+    
+    # Centered subtitle for booking number
+    subtitle_style = ParagraphStyle(
+        'CenteredSubtitle',
+        parent=styles['Heading2'],
+        alignment=1,
+        textColor=colors.HexColor('#555555'),
         spaceAfter=30
     )
 
-    story.append(Paragraph(f"UniteOman Invoice", title_style))
-    story.append(Paragraph(f"Booking #{booking.booking_number}", styles['Heading2']))
-    story.append(Spacer(1, 20))
+    story.append(Paragraph("Invoice", title_style))
+    story.append(Paragraph(f"Booking #{booking.booking_number}", subtitle_style))
+    story.append(Spacer(1, 10))
 
     booking_data = [
         ["Booking Number:", booking.booking_number],
@@ -392,7 +403,14 @@ def download_receipt_pdf(request, booking_id):
     story.append(Paragraph(f"Payment Method: {booking.payment_method}", styles['Normal']))
     story.append(Spacer(1, 10))
 
-    story.append(Paragraph("Thank you for using UniteOman!", styles['Normal']))
+    # Center aligned bottom greeting style
+    footer_text_style = ParagraphStyle(
+        'FooterText',
+        parent=styles['Normal'],
+        alignment=1,
+        textColor=colors.HexColor('#777777')
+    )
+    story.append(Paragraph("Thank you for using UniteOman!", footer_text_style))
 
     doc.build(story)
 
