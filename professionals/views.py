@@ -511,6 +511,8 @@ def area_list(request):
 # POST /api/bookings/create/ (Sync Integrated Natively Here)
 # ---------------------------------------------------------------------------
 
+# In professionals/views.py - Fixed booking_create function
+
 @csrf_exempt
 def booking_create(request):
     if request.method != "POST":
@@ -533,6 +535,7 @@ def booking_create(request):
             "message": f"Missing required fields: {', '.join(missing)}",
         }, status=400)
 
+    # Get professional from professionals app
     try:
         pro = Professional.objects.get(pk=payload["professional_id"], is_active=True)
     except Professional.DoesNotExist:
@@ -590,18 +593,66 @@ def booking_create(request):
     booking.calculate_pricing()
     booking.save()
 
-    # 2. AUTO-SYNC: Mirror record completely into the services app booking table
-    from django.utils.timezone import make_aware
+    # 2. Find or create professional in services app
+    from services.models import Professional as ServiceProfessional
+    
+    # Try to find existing service professional by name and specialty
+    service_pro = ServiceProfessional.objects.filter(
+        name=pro.name,
+        specialty=pro.specialty
+    ).first()
+    
+    if not service_pro:
+        # Create a new service professional
+        service_pro = ServiceProfessional.objects.create(
+            name=pro.name,
+            specialty=pro.specialty,
+            rating=pro.rating,
+            jobs_count=pro.jobs_done,
+            avatar=pro.avatar
+        )
+        print(f"Created service professional: {service_pro.name} with ID {service_pro.id}")
 
+    # 3. Find or create user for the services app booking
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+    
+    matched_user = None
+    try:
+        matched_user = User.objects.filter(email=payload["user_email"]).first()
+    except Exception:
+        pass
+    
+    if not matched_user:
+        try:
+            import random
+            import string
+            random_password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
+            username = payload["user_email"].split('@')[0] + str(random.randint(1000, 9999))
+            matched_user = User.objects.create_user(
+                username=username,
+                email=payload["user_email"],
+                password=random_password,
+                first_name=payload["user_name"].split()[0] if payload["user_name"] else "",
+                last_name=' '.join(payload["user_name"].split()[1:]) if len(payload["user_name"].split()) > 1 else "",
+            )
+        except Exception as e:
+            print(f"User creation failed: {e}")
+            matched_user = None
+
+    from django.utils.timezone import make_aware
     combined_datetime = datetime.combine(booking.booking_date, booking.booking_time)
     if combined_datetime.tzinfo is None:
         combined_datetime = make_aware(combined_datetime)
 
+    # 4. Create the service booking record with the correct professional ID
+    from services.models import Booking as ServiceBooking
+    
     ServiceBooking.objects.create(
         booking_number=booking.booking_code,
-        user_id=1,  # Standard architectural fallback profile ID map
+        user_id=matched_user.id if matched_user else None,
         service_type=booking.service_type,
-        professional_id=booking.professional.id,
+        professional_id=service_pro.id,  # Use the service app professional ID
         scheduled_at=combined_datetime,
         duration_minutes=45,
         location_name=booking.area,
