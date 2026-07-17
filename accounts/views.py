@@ -139,20 +139,19 @@ def login_user(request):
     serializer = UserLoginSerializer(data=request.data)
     if not serializer.is_valid():
         return Response({'error': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
-    
+
     user = serializer.validated_data['user']
-    
-    # Generate JWT token (if using JWT)
+
     from rest_framework_simplejwt.tokens import RefreshToken
     refresh = RefreshToken.for_user(user)
-    
+
     return Response({
         'message': 'Login successful',
+        'user_id': user.id,   # <-- added, backward compatible
         'user': UserProfileSerializer(user).data,
         'access': str(refresh.access_token),
         'refresh': str(refresh),
     }, status=status.HTTP_200_OK)
-
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])

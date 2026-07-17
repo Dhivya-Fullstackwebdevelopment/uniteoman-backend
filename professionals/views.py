@@ -11,6 +11,10 @@ from django.views.decorators.csrf import csrf_exempt
 from services.models import Service, ServiceType
 from services.models import Booking as ServiceBooking  # Imported for auto-syncing
 from .models import Professional, ProfessionalServiceType, Review, Booking
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework_simplejwt.authentication import JWTAuthentication
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -513,15 +517,11 @@ def area_list(request):
 
 # In professionals/views.py - Fixed booking_create function
 
-@csrf_exempt
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
 def booking_create(request):
-    if request.method != "POST":
-        return JsonResponse({"status": "error", "message": "POST required."}, status=405)
-
-    try:
-        payload = json.loads(request.body.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return JsonResponse({"status": "error", "message": "Invalid JSON body."}, status=400)
+    payload = request.data
 
     required_fields = [
         "professional_id", "service_type_id", "booking_date", "booking_time",
@@ -530,21 +530,20 @@ def booking_create(request):
     ]
     missing = [f for f in required_fields if not payload.get(f)]
     if missing:
-        return JsonResponse({
+        return Response({
             "status": "error",
             "message": f"Missing required fields: {', '.join(missing)}",
         }, status=400)
 
-    # Get professional from professionals app
     try:
         pro = Professional.objects.get(pk=payload["professional_id"], is_active=True)
     except Professional.DoesNotExist:
-        return JsonResponse({"status": "error", "message": "Professional not found."}, status=404)
+        return Response({"status": "error", "message": "Professional not found."}, status=404)
 
     try:
         service_type = ServiceType.objects.get(pk=payload["service_type_id"], is_active=True)
     except ServiceType.DoesNotExist:
-        return JsonResponse({"status": "error", "message": "Service type not found."}, status=404)
+        return Response({"status": "error", "message": "Service type not found."}, status=404)
 
     offering = ProfessionalServiceType.objects.filter(
         professional=pro, service_type=service_type, is_active=True
@@ -555,7 +554,7 @@ def booking_create(request):
         booking_date = datetime.strptime(payload["booking_date"], "%Y-%m-%d").date()
         booking_time = datetime.strptime(payload["booking_time"], "%H:%M").time()
     except ValueError:
-        return JsonResponse({
+        return Response({
             "status": "error",
             "message": "Invalid date/time format. Use booking_date=YYYY-MM-DD, booking_time=HH:MM.",
         }, status=400)
@@ -567,7 +566,7 @@ def booking_create(request):
         status__in=[Booking.STATUS_PENDING, Booking.STATUS_CONFIRMED],
     ).exists()
     if clash:
-        return JsonResponse({"status": "error", "message": "This time slot is no longer available."}, status=409)
+        return Response({"status": "error", "message": "This time slot is no longer available."}, status=409)
 
     # 1. Save booking in the professional app
     booking = Booking(
@@ -595,15 +594,13 @@ def booking_create(request):
 
     # 2. Find or create professional in services app
     from services.models import Professional as ServiceProfessional
-    
-    # Try to find existing service professional by name and specialty
+
     service_pro = ServiceProfessional.objects.filter(
         name=pro.name,
         specialty=pro.specialty
     ).first()
-    
+
     if not service_pro:
-        # Create a new service professional
         service_pro = ServiceProfessional.objects.create(
             name=pro.name,
             specialty=pro.specialty,
@@ -613,46 +610,22 @@ def booking_create(request):
         )
         print(f"Created service professional: {service_pro.name} with ID {service_pro.id}")
 
-    # 3. Find or create user for the services app booking
-    from django.contrib.auth import get_user_model
-    User = get_user_model()
-    
-    matched_user = None
-    try:
-        matched_user = User.objects.filter(email=payload["user_email"]).first()
-    except Exception:
-        pass
-    
-    if not matched_user:
-        try:
-            import random
-            import string
-            random_password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
-            username = payload["user_email"].split('@')[0] + str(random.randint(1000, 9999))
-            matched_user = User.objects.create_user(
-                username=username,
-                email=payload["user_email"],
-                password=random_password,
-                first_name=payload["user_name"].split()[0] if payload["user_name"] else "",
-                last_name=' '.join(payload["user_name"].split()[1:]) if len(payload["user_name"].split()) > 1 else "",
-            )
-        except Exception as e:
-            print(f"User creation failed: {e}")
-            matched_user = None
+    # 3. Use the AUTHENTICATED user directly (no more email lookup / silent account creation)
+    matched_user = request.user
 
     from django.utils.timezone import make_aware
     combined_datetime = datetime.combine(booking.booking_date, booking.booking_time)
     if combined_datetime.tzinfo is None:
         combined_datetime = make_aware(combined_datetime)
 
-    # 4. Create the service booking record with the correct professional ID
+    # 4. Create the service booking record, linked to the authenticated user
     from services.models import Booking as ServiceBooking
-    
+
     ServiceBooking.objects.create(
         booking_number=booking.booking_code,
-        user_id=matched_user.id if matched_user else None,
+        user_id=matched_user.id,   # <-- always the authenticated user's id
         service_type=booking.service_type,
-        professional_id=service_pro.id,  # Use the service app professional ID
+        professional_id=service_pro.id,
         scheduled_at=combined_datetime,
         duration_minutes=45,
         location_name=booking.area,
@@ -665,7 +638,7 @@ def booking_create(request):
         payment_method=booking.get_payment_method_display()
     )
 
-    return JsonResponse({
+    return Response({
         "status": "success",
         "message": "Booking created successfully.",
         "data": serialize_booking(booking, request),
