@@ -1,89 +1,75 @@
-from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
-from rest_framework.authtoken.models import Token
-from django.contrib.auth import authenticate
-from django.utils import timezone
+from rest_framework import status
+from django.contrib.auth import authenticate, login, logout
+from django.core.mail import send_mail
+from django.conf import settings
+from twilio.rest import Client
 from .models import User, OTP
 from .serializers import (
     OTPSendSerializer, OTPVerifySerializer, 
     UserRegisterSerializer, UserLoginSerializer,
     UserProfileSerializer
 )
-import logging
 
-logger = logging.getLogger(__name__)
-
-# ------------------- SMS Helper Functions -------------------
-
-def send_otp_sms(mobile_number, otp_code):
-    """
-    Send OTP via SMS - Testing mode or Twilio
-    """
-    try:
-        # For testing: Print OTP to console
-        print(f"=====================================")
-        print(f"📱 OTP for {mobile_number}: {otp_code}")
-        print(f"⏰ Expires in 5 minutes")
-        print(f"=====================================")
-        
-        # Uncomment for production with Twilio
-        # from twilio.rest import Client
-        # from django.conf import settings
-        # client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
-        # message = client.messages.create(
-        #     body=f"Your OTP for UniteOman is: {otp_code}. Valid for 5 minutes.",
-        #     from_=settings.TWILIO_PHONE_NUMBER,
-        #     to=f"+{mobile_number}"  # Add country code if needed
-        # )
-        return True
-    except Exception as e:
-        logger.error(f"SMS sending failed: {str(e)}")
-        return False
-
-# ------------------- API Views -------------------
+# ============ OTP ENDPOINTS ============
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def send_otp(request):
     """
-    Send OTP to mobile number
+    Send OTP via SMS (Twilio) and Email
     """
     serializer = OTPSendSerializer(data=request.data)
     if not serializer.is_valid():
-        return Response({
-            'status': 'error',
-            'message': 'Invalid data',
-            'errors': serializer.errors
-        }, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'error': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
     
     mobile_number = serializer.validated_data['mobile_number']
     
-    # Check if user exists
-    user_exists = User.objects.filter(mobile_number=mobile_number).exists()
+    # Generate OTP
+    otp_instance = OTP.create_otp(mobile_number)
+    otp_code = otp_instance.otp_code
     
-    # Create OTP
-    otp = OTP.create_otp(mobile_number)
+    # Send OTP via Twilio SMS
+    try:
+        client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
+        message = client.messages.create(
+            body=f'Your OTP code is: {otp_code}',
+            from_=settings.TWILIO_PHONE_NUMBER,
+            to=f'+{mobile_number}'
+        )
+        print(f"✅ SMS sent: {message.sid}")
+    except Exception as e:
+        print(f"❌ SMS failed: {str(e)}")
+        # Still continue - we'll also send via email
     
-    # Send SMS
-    sms_sent = send_otp_sms(mobile_number, otp.otp_code)
+    # Send OTP via Email (if user has email)
+    try:
+        # If user exists and has email
+        user = User.objects.filter(mobile_number=mobile_number).first()
+        if user and user.email:
+            send_mail(
+                subject='Your OTP Code',
+                message=f'Your OTP code is: {otp_code}\nThis code expires in 5 minutes.',
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[user.email],
+                fail_silently=False,
+            )
+            print(f"✅ Email sent to: {user.email}")
+    except Exception as e:
+        print(f"❌ Email failed: {str(e)}")
     
-    if not sms_sent:
-        return Response({
-            'status': 'error',
-            'message': 'Failed to send OTP. Please try again.'
-        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    # For testing - print OTP to console
+    print(f"📱 OTP for {mobile_number}: {otp_code}")
     
     return Response({
-        'status': 'success',
         'message': 'OTP sent successfully',
-        'data': {
-            'mobile_number': mobile_number,
-            'expires_in': '5 minutes',
-            'user_exists': user_exists
-        }
-    })
+        'mobile_number': mobile_number,
+        # Remove this in production, keep for testing
+        'debug_otp': otp_code  
+    }, status=status.HTTP_200_OK)
+
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -93,84 +79,56 @@ def verify_otp(request):
     """
     serializer = OTPVerifySerializer(data=request.data)
     if not serializer.is_valid():
-        return Response({
-            'status': 'error',
-            'message': 'Invalid data',
-            'errors': serializer.errors
-        }, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'error': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
     
-    mobile_number = serializer.validated_data['mobile_number']
+    # Get OTP instance from validated data
     otp_instance = serializer.validated_data['otp_instance']
     
     # Mark OTP as verified
     otp_instance.is_verified = True
     otp_instance.save()
     
-    # Check if user already exists
-    user = User.objects.filter(mobile_number=mobile_number).first()
+    # Update user if exists
+    mobile_number = serializer.validated_data['mobile_number']
+    try:
+        user = User.objects.get(mobile_number=mobile_number)
+        user.is_mobile_verified = True
+        user.save()
+    except User.DoesNotExist:
+        pass
     
     return Response({
-        'status': 'success',
         'message': 'OTP verified successfully',
-        'data': {
-            'mobile_number': mobile_number,
-            'is_verified': True,
-            'user_exists': user is not None,
-            'user': UserProfileSerializer(user).data if user else None
-        }
-    })
+        'mobile_number': mobile_number
+    }, status=status.HTTP_200_OK)
+
+
+# ============ AUTH ENDPOINTS ============
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def register_user(request):
     """
-    Register new user after OTP verification
+    Register a new user
     """
-    # Check if OTP is verified
+    # Check if mobile is verified
     mobile_number = request.data.get('mobile_number')
+    if mobile_number:
+        if not OTP.objects.filter(mobile_number=mobile_number, is_verified=True).exists():
+            return Response({
+                'error': 'Mobile number not verified. Please verify OTP first.'
+            }, status=status.HTTP_400_BAD_REQUEST)
     
-    try:
-        otp = OTP.objects.get(
-            mobile_number=mobile_number,
-            is_verified=True
-        )
-    except OTP.DoesNotExist:
-        return Response({
-            'status': 'error',
-            'message': 'Mobile number not verified. Please verify OTP first.'
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    # Check if user already exists
-    if User.objects.filter(mobile_number=mobile_number).exists():
-        return Response({
-            'status': 'error',
-            'message': 'User already exists with this mobile number. Please login.'
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    # Create user
     serializer = UserRegisterSerializer(data=request.data)
-    if not serializer.is_valid():
+    if serializer.is_valid():
+        user = serializer.save()
         return Response({
-            'status': 'error',
-            'message': 'Invalid data',
-            'errors': serializer.errors
-        }, status=status.HTTP_400_BAD_REQUEST)
+            'message': 'User registered successfully',
+            'user': UserProfileSerializer(user).data
+        }, status=status.HTTP_201_CREATED)
     
-    user = serializer.save()
-    user.is_mobile_verified = True
-    user.save()
-    
-    # Create token
-    token, created = Token.objects.get_or_create(user=user)
-    
-    return Response({
-        'status': 'success',
-        'message': 'Account created successfully',
-        'data': {
-            'user': UserProfileSerializer(user).data,
-            'token': token.key
-        }
-    })
+    return Response({'error': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -180,25 +138,33 @@ def login_user(request):
     """
     serializer = UserLoginSerializer(data=request.data)
     if not serializer.is_valid():
-        return Response({
-            'status': 'error',
-            'message': 'Invalid credentials',
-            'errors': serializer.errors
-        }, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'error': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
     
     user = serializer.validated_data['user']
     
-    # Create or get token
-    token, created = Token.objects.get_or_create(user=user)
+    # Generate JWT token (if using JWT)
+    from rest_framework_simplejwt.tokens import RefreshToken
+    refresh = RefreshToken.for_user(user)
     
     return Response({
-        'status': 'success',
         'message': 'Login successful',
-        'data': {
-            'user': UserProfileSerializer(user).data,
-            'token': token.key
-        }
-    })
+        'user': UserProfileSerializer(user).data,
+        'access': str(refresh.access_token),
+        'refresh': str(refresh),
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def logout_user(request):
+    """
+    Logout user
+    """
+    logout(request)
+    return Response({'message': 'Logged out successfully'}, status=status.HTTP_200_OK)
+
+
+# ============ PROFILE ENDPOINTS ============
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -207,45 +173,30 @@ def get_profile(request):
     Get user profile
     """
     serializer = UserProfileSerializer(request.user)
-    return Response({
-        'status': 'success',
-        'data': serializer.data
-    })
+    return Response(serializer.data, status=status.HTTP_200_OK)
 
-@api_view(['POST'])
+
+@api_view(['PUT', 'PATCH'])
 @permission_classes([IsAuthenticated])
 def update_profile(request):
     """
     Update user profile
     """
     user = request.user
-    user.name = request.data.get('name', user.name)
-    user.email = request.data.get('email', user.email)
-    user.save()
+    serializer = UserProfileSerializer(user, data=request.data, partial=True)
     
-    return Response({
-        'status': 'success',
-        'message': 'Profile updated successfully',
-        'data': UserProfileSerializer(user).data
-    })
-
-@api_view(['POST'])
-@permission_classes([IsAuthenticated])
-def logout_user(request):
-    """
-    Logout user (delete token)
-    """
-    try:
-        request.user.auth_token.delete()
-    except:
-        pass
+    if serializer.is_valid():
+        serializer.save()
+        return Response({
+            'message': 'Profile updated successfully',
+            'user': serializer.data
+        }, status=status.HTTP_200_OK)
     
-    return Response({
-        'status': 'success',
-        'message': 'Logged out successfully'
-    })
+    return Response({'error': serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
 
-# Forgot Password - Send OTP
+
+# ============ PASSWORD RESET ============
+
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def forgot_password(request):
@@ -255,91 +206,76 @@ def forgot_password(request):
     mobile_number = request.data.get('mobile_number')
     
     if not mobile_number:
-        return Response({
-            'status': 'error',
-            'message': 'Mobile number is required'
-        }, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'error': 'Mobile number is required'}, 
+                       status=status.HTTP_400_BAD_REQUEST)
     
-    # Check if user exists
     try:
         user = User.objects.get(mobile_number=mobile_number)
     except User.DoesNotExist:
-        return Response({
-            'status': 'error',
-            'message': 'User not found with this mobile number'
-        }, status=status.HTTP_404_NOT_FOUND)
+        return Response({'error': 'User with this mobile number does not exist'}, 
+                       status=status.HTTP_404_NOT_FOUND)
     
-    # Create OTP
-    otp = OTP.create_otp(mobile_number)
+    # Send OTP for password reset
+    otp_instance = OTP.create_otp(mobile_number)
     
-    # Send SMS
-    send_otp_sms(mobile_number, otp.otp_code)
+    # Send OTP via SMS
+    try:
+        client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
+        message = client.messages.create(
+            body=f'Your password reset OTP is: {otp_instance.otp_code}',
+            from_=settings.TWILIO_PHONE_NUMBER,
+            to=f'+{mobile_number}'
+        )
+    except Exception as e:
+        print(f"❌ SMS failed: {str(e)}")
     
     return Response({
-        'status': 'success',
-        'message': 'OTP sent for password reset',
-        'data': {
-            'mobile_number': mobile_number,
-            'expires_in': '5 minutes'
-        }
-    })
+        'message': 'Password reset OTP sent',
+        'mobile_number': mobile_number,
+        'debug_otp': otp_instance.otp_code  # Remove in production
+    }, status=status.HTTP_200_OK)
 
-# Reset Password
+
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def reset_password(request):
     """
-    Reset password after OTP verification
+    Reset password using OTP
     """
     mobile_number = request.data.get('mobile_number')
+    otp_code = request.data.get('otp_code')
     new_password = request.data.get('new_password')
-    confirm_password = request.data.get('confirm_password')
     
-    if not all([mobile_number, new_password, confirm_password]):
-        return Response({
-            'status': 'error',
-            'message': 'All fields are required'
-        }, status=status.HTTP_400_BAD_REQUEST)
+    if not all([mobile_number, otp_code, new_password]):
+        return Response({'error': 'All fields are required'}, 
+                       status=status.HTTP_400_BAD_REQUEST)
     
-    if new_password != confirm_password:
-        return Response({
-            'status': 'error',
-            'message': 'Passwords do not match'
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    if len(new_password) < 6:
-        return Response({
-            'status': 'error',
-            'message': 'Password must be at least 6 characters'
-        }, status=status.HTTP_400_BAD_REQUEST)
-    
-    # Check OTP verification
+    # Verify OTP
     try:
         otp = OTP.objects.get(
             mobile_number=mobile_number,
-            is_verified=True
+            otp_code=otp_code,
+            is_verified=False
         )
     except OTP.DoesNotExist:
-        return Response({
-            'status': 'error',
-            'message': 'Mobile number not verified. Please verify OTP first.'
-        }, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'error': 'Invalid OTP'}, 
+                       status=status.HTTP_400_BAD_REQUEST)
+    
+    if otp.is_expired():
+        return Response({'error': 'OTP has expired'}, 
+                       status=status.HTTP_400_BAD_REQUEST)
+    
+    # Mark OTP as verified
+    otp.is_verified = True
+    otp.save()
     
     # Update password
     try:
         user = User.objects.get(mobile_number=mobile_number)
         user.set_password(new_password)
         user.save()
-        
-        # Invalidate the OTP
-        otp.delete()
-        
-        return Response({
-            'status': 'success',
-            'message': 'Password reset successfully'
-        })
+        return Response({'message': 'Password reset successfully'}, 
+                       status=status.HTTP_200_OK)
     except User.DoesNotExist:
-        return Response({
-            'status': 'error',
-            'message': 'User not found'
-        }, status=status.HTTP_404_NOT_FOUND)
+        return Response({'error': 'User not found'}, 
+                       status=status.HTTP_404_NOT_FOUND)
