@@ -15,7 +15,10 @@ from rest_framework.decorators import api_view, authentication_classes, permissi
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.authentication import JWTAuthentication
-
+from services.models import Booking as ServiceBooking
+from professionals.models import Booking as ProBooking
+from django.shortcuts import get_object_or_404 
+from django.db import transaction
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -812,3 +815,106 @@ def service_booking_cancel(request, service_booking_id):
             "status": service_booking.status,
         },
     })
+
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def reschedule_booking(request, service_booking_id):
+    """
+    Safely reschedules a booking for both the professional and services apps.
+    Expects payload: {"booking_date": "YYYY-MM-DD", "booking_time": "HH:MM"}
+    """
+    payload = request.data
+    new_date_str = payload.get("booking_date")
+    new_time_str = payload.get("booking_time")
+
+    if not new_date_str or not new_time_str:
+        return Response({
+            "status": "error",
+            "message": "Missing required fields: booking_date and booking_time are required."
+        }, status=400)
+
+    # 1. Fetch the main client service booking record (Ensure ownership)
+    service_booking = get_object_or_404(ServiceBooking, id=service_booking_id, user=request.user)
+
+    if service_booking.status in ['CANCELLED', 'COMPLETED']:
+        return Response({
+            "status": "error",
+            "message": f"Cannot reschedule a booking that is already {service_booking.status.lower()}."
+        }, status=400)
+
+    # 2. Fetch the corresponding internal professional app booking record
+    pro_booking = ProBooking.objects.filter(booking_code=service_booking.booking_number).first()
+    if not pro_booking:
+        return Response({
+            "status": "error",
+            "message": "Associated professional booking record could not be found."
+        }, status=404)
+
+    # 3. Parse input values
+    try:
+        new_booking_date = datetime.strptime(new_date_str, "%Y-%m-%d").date()
+        new_booking_time = datetime.strptime(new_time_str, "%H:%M").time()
+    except ValueError:
+        return Response({
+            "status": "error",
+            "message": "Invalid format. Use booking_date=YYYY-MM-DD, booking_time=HH:MM."
+        }, status=400)
+
+    # 4. Generate timezone aware datetimes for clash checking
+   
+    from django.utils.timezone import make_aware, is_naive
+
+    combined_dt = datetime.combine(new_booking_date, new_booking_time)
+    if is_naive(combined_dt):
+        combined_dt = make_aware(combined_dt)
+
+    # Check 1: Absolute Professional Availability Clash Guard (Exclude current booking)
+    pro_clash = ProBooking.objects.filter(
+        professional=pro_booking.professional,
+        booking_date=new_booking_date,
+        booking_time=new_booking_time,
+        status__in=[ProBooking.STATUS_PENDING, ProBooking.STATUS_CONFIRMED]
+    ).exclude(id=pro_booking.id).exists()
+
+    if pro_clash:
+        return Response({
+            "status": "error",
+            "message": f"{pro_booking.professional.name} is already booked at {new_booking_time.strftime('%I:%M %p').lstrip('0')} on this date."
+        }, status=409)
+
+    # Check 2: User Duplicate Booking Guard (Exclude current booking)
+    user_clash = ServiceBooking.objects.filter(
+        user_id=request.user.id,
+        scheduled_at=combined_dt
+    ).exclude(status__in=["CANCELLED", "COMPLETED"]).exclude(id=service_booking.id).first()
+
+    if user_clash:
+        return Response({
+            "status": "error",
+            "message": "You already have another active service scheduled at this exact time."
+        }, status=409)
+
+    # 5. Atomically update both booking objects
+    with transaction.atomic():
+        # Update professional tracking record
+        pro_booking.booking_date = new_booking_date
+        pro_booking.booking_time = new_booking_time
+        # Revert back to pending status if it was confirmed to let them re-verify
+        pro_booking.status = ProBooking.STATUS_PENDING 
+        pro_booking.save(update_fields=["booking_date", "booking_time", "status", "updated_at"])
+
+        # Update service engine tracking record
+        service_booking.scheduled_at = combined_dt
+        service_booking.status = "PENDING"
+        service_booking.save(update_fields=["scheduled_at", "status"])
+
+    return Response({
+        "status": "success",
+        "message": f"Booking successfully rescheduled to {new_booking_date} at {new_booking_time.strftime('%I:%M %p').lstrip('0')}.",
+        "data": {
+            "booking_number": service_booking.booking_number,
+            "new_scheduled_at": service_booking.scheduled_at.strftime('%Y-%m-%d %H:%M'),
+            "status": service_booking.status
+        }
+    }, status=200)

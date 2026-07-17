@@ -24,4 +24,5 @@ urlpatterns = [
 
     # path("bookings/<int:pk>/cancel/", views.booking_cancel),
     path("bookings/<int:service_booking_id>/cancel/", views.service_booking_cancel),
+    path("bookings/<int:service_booking_id>/reschedule/", views.reschedule_booking, name="reschedule_booking_api"),
 ]
