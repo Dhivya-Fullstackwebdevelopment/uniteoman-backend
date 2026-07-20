@@ -87,11 +87,13 @@ class Review(models.Model):
 class Booking(models.Model):
     STATUS_PENDING = "pending"
     STATUS_CONFIRMED = "confirmed"
+    STATUS_ONGOING = "ongoing"
     STATUS_CANCELLED = "cancelled"
     STATUS_COMPLETED = "completed"
     STATUS_CHOICES = [
         (STATUS_PENDING, "Pending"),
         (STATUS_CONFIRMED, "Confirmed"),
+        (STATUS_ONGOING, "Ongoing"),
         (STATUS_CANCELLED, "Cancelled"),
         (STATUS_COMPLETED, "Completed"),
     ]

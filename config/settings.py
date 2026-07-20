@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+from datetime import timedelta
 
 
 # Load variables from the hidden .env file at the very start
@@ -52,6 +53,8 @@ AUTHENTICATION_BACKENDS = [
     'django.contrib.auth.backends.ModelBackend',
 ]
 
+AUTH_USER_MODEL = 'accounts.User'
+
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework.authentication.TokenAuthentication',
@@ -78,6 +81,14 @@ CORS_ALLOW_ALL_ORIGINS = True  # For development only
 # OTP settings
 OTP_EXPIRY_MINUTES = 5
 OTP_LENGTH = 6
+
+SIMPLE_JWT = {
+    'ACCESS_TOKEN_LIFETIME': timedelta(days=1),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=1),
+    'ROTATE_REFRESH_TOKENS': False,
+    'BLACKLIST_AFTER_ROTATION': True,
+    'UPDATE_LAST_LOGIN': True,
+}
 
 # SMS configuration (Safely loaded from the hidden environment)
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
