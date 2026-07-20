@@ -114,7 +114,13 @@ class Booking(models.Model):
     user_mobile = models.CharField(max_length=20)
 
     # What / who
-    professional = models.ForeignKey(Professional, on_delete=models.CASCADE, related_name="bookings")
+    professional = models.ForeignKey(
+        Professional,
+        on_delete=models.CASCADE,
+        related_name="bookings",
+        null=True,
+        blank=True,
+    )  # <-- CHANGED: now nullable, so an unassigned booking stores NULL instead of 0
     service_type = models.ForeignKey(ServiceType, on_delete=models.CASCADE, related_name="bookings")
 
     # Date & time
@@ -152,7 +158,8 @@ class Booking(models.Model):
         ordering = ["-created_at"]
 
     def __str__(self):
-        return f"{self.booking_code} - {self.user_name} -> {self.professional.name}"
+        pro_name = self.professional.name if self.professional else "Unassigned"
+        return f"{self.booking_code} - {self.user_name} -> {pro_name}"  # <-- CHANGED: guards against professional=None
 
     def calculate_pricing(self):
       from decimal import Decimal

@@ -67,23 +67,28 @@ class Booking(models.Model):
         ('CANCELLED', 'Cancelled'),
     ]
 
-    booking_number = models.CharField(max_length=50, unique=True) # e.g., UO-4601
+    booking_number = models.CharField(max_length=50, unique=True)  # e.g., UO-4601
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     service_type = models.ForeignKey(ServiceType, on_delete=models.CASCADE)
-    professional = models.ForeignKey(Professional, on_delete=models.CASCADE)
+    professional = models.ForeignKey(
+        Professional,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )  # <-- CHANGED: nullable, so unassigned bookings store NULL
     scheduled_at = models.DateTimeField()
     duration_minutes = models.IntegerField(default=45)
-    location_name = models.CharField(max_length=255) # e.g., Qurum
-    address = models.TextField() # e.g., Villa 12, Al Noor St, Qurum
+    location_name = models.CharField(max_length=255)
+    address = models.TextField()
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='SCHEDULED')
-    
+
     # Financial Elements
     service_fee = models.DecimalField(max_digits=10, decimal_places=3)
     platform_fee = models.DecimalField(max_digits=10, decimal_places=3)
     vat = models.DecimalField(max_digits=10, decimal_places=3)
     total_paid = models.DecimalField(max_digits=10, decimal_places=3)
     payment_method = models.CharField(max_length=100, default="Bank of Muscat ****4521")
-    
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):

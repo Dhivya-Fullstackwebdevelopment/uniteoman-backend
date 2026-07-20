@@ -527,84 +527,75 @@ def area_list(request):
 def booking_create(request):
     payload = request.data
 
-    # Define required fields (professional_id is now optional)
     required_fields = [
-        "service_type_id", "booking_date", "booking_time",
-        "user_name", "user_email", "user_mobile",
-        "area", "villa_apartment_no", "street_name",
+        "service_type_id",
+        "booking_date",
+        "booking_time",
+        "user_name",
+        "user_email",
+        "user_mobile",
+        "area",
+        "villa_apartment_no",
+        "street_name",
     ]
-    
-    # Optional fields (professional_id is now optional)
-    optional_fields = ["professional_id", "building_floor", "nearest_landmark", 
-                       "latitude", "longitude", "payment_method", "card_last4", "save_card"]
-    
-    missing = [f for f in required_fields if not payload.get(f)]
+
+    missing = [f for f in required_fields if payload.get(f) in (None, "")]
     if missing:
         return Response({
             "status": "error",
             "message": f"Missing required fields: {', '.join(missing)}",
         }, status=400)
 
-    # Handle professional_id - if not provided, you can either:
-    # 1. Assign a default professional, or
-    # 2. Auto-assign based on service_type, or
-    # 3. Return error if professional_id is required for your business logic
-    
-    professional_id = payload.get("professional_id")
+    # --- professional_id is OPTIONAL. Not sent / null / "" / 0 -> unassigned (NULL). ---
+    raw_professional_id = payload.get("professional_id", 0)
+    if raw_professional_id in (None, ""):
+        raw_professional_id = 0
+
+    try:
+        professional_id = int(raw_professional_id)
+    except (TypeError, ValueError):
+        return Response({
+            "status": "error",
+            "message": "professional_id must be an integer."
+        }, status=400)
+
+    is_unassigned = professional_id == 0
     pro = None
-    
-    if professional_id:
+
+    if not is_unassigned:
         try:
             pro = Professional.objects.get(pk=professional_id, is_active=True)
         except Professional.DoesNotExist:
-            return Response({"status": "error", "message": "Professional not found."}, status=404)
-    else:
-        # Option A: Auto-assign a professional based on service_type
-        # Find the first available professional for this service type
-        service_type_id = payload["service_type_id"]
-        try:
-            service_type = ServiceType.objects.get(pk=service_type_id, is_active=True)
-            
-            # Find active professionals offering this service type
-            available_pros = Professional.objects.filter(
-                offerings__service_type=service_type,
-                offerings__is_active=True,
-                is_active=True
-            ).distinct()
-            
-            if available_pros.exists():
-                # You can add more sophisticated logic here (rating, availability, etc.)
-                pro = available_pros.first()  # Simple: pick the first one
-                # Or pick the highest rated:
-                # pro = available_pros.order_by('-rating').first()
-                # Or pick the one with most jobs done:
-                # pro = available_pros.order_by('-jobs_done').first()
-            else:
-                return Response({
-                    "status": "error", 
-                    "message": f"No active professionals available for service type: {service_type.type_name}"
-                }, status=404)
-                
-        except ServiceType.DoesNotExist:
-            return Response({"status": "error", "message": "Service type not found."}, status=404)
+            return Response({
+                "status": "error",
+                "message": f"Professional with ID {professional_id} not found."
+            }, status=404)
 
     try:
         service_type = ServiceType.objects.get(pk=payload["service_type_id"], is_active=True)
     except ServiceType.DoesNotExist:
-        return Response({"status": "error", "message": "Service type not found."}, status=404)
-
-    # Get offering and service fee
-    offering = ProfessionalServiceType.objects.filter(
-        professional=pro, service_type=service_type, is_active=True
-    ).first()
-    
-    if not offering:
         return Response({
             "status": "error",
-            "message": f"{pro.name} does not offer this service type."
-        }, status=400)
-    
-    service_fee = offering.price
+            "message": "Service type not found."
+        }, status=404)
+
+    # Check if professional offers this service (skip when unassigned)
+    if is_unassigned:
+        service_fee = service_type.price
+    else:
+        offering = ProfessionalServiceType.objects.filter(
+            professional=pro,
+            service_type=service_type,
+            is_active=True
+        ).first()
+
+        if not offering:
+            return Response({
+                "status": "error",
+                "message": f"{pro.name} does not offer this service type."
+            }, status=400)
+
+        service_fee = offering.price
 
     try:
         booking_date = datetime.strptime(payload["booking_date"], "%Y-%m-%d").date()
@@ -615,25 +606,22 @@ def booking_create(request):
             "message": "Invalid date/time format. Use booking_date=YYYY-MM-DD, booking_time=HH:MM.",
         }, status=400)
 
-    # ---------------------------------------------------------------------------
-    # 1. Check for absolute Professional Availability (Clash Check)
-    # ---------------------------------------------------------------------------
-    clash = Booking.objects.filter(
-        professional=pro,
-        booking_date=booking_date,
-        booking_time=booking_time,
-        status__in=[Booking.STATUS_PENDING, Booking.STATUS_CONFIRMED],
-    ).exists()
-    
-    if clash:
-        return Response({
-            "status": "error",
-            "message": f"{pro.name} is already booked at {booking_time.strftime('%I:%M %p').lstrip('0')} on this date. Please pick another time slot."
-        }, status=409)
+    # Check availability clash for this professional (skip when unassigned)
+    if not is_unassigned:
+        clash = Booking.objects.filter(
+            professional=pro,
+            booking_date=booking_date,
+            booking_time=booking_time,
+            status__in=[Booking.STATUS_PENDING, Booking.STATUS_CONFIRMED],
+        ).exists()
 
-    # ---------------------------------------------------------------------------
-    # 2. Duplicate-booking guard (User already has a booking here)
-    # ---------------------------------------------------------------------------
+        if clash:
+            return Response({
+                "status": "error",
+                "message": f"{pro.name} is already booked at {booking_time.strftime('%I:%M %p').lstrip('0')} on this date. Please pick another time slot."
+            }, status=409)
+
+    # Check duplicate booking for this user at the same datetime
     combined_dt = datetime.combine(booking_date, booking_time)
     if is_naive(combined_dt):
         combined_dt = make_aware(combined_dt)
@@ -647,20 +635,15 @@ def booking_create(request):
         existing_local_dt = timezone.localtime(duplicate_booking.scheduled_at)
         return Response({
             "status": "error",
-            "message": (
-                f"You have already booked a service on "
-                f"{existing_local_dt.strftime('%d %b %Y')} at "
-                f"{existing_local_dt.strftime('%I:%M %p').lstrip('0')}. "
-                f"Please choose a different time slot."
-            ),
+            "message": f"You already have a booking at {existing_local_dt.strftime('%I:%M %p').lstrip('0')} on {existing_local_dt.strftime('%d %b %Y')}. Please choose a different time slot."
         }, status=409)
 
-    # 1. Save booking in the professional app
+    # Create booking — professional is None when unassigned
     booking = Booking(
         user_name=payload["user_name"],
         user_email=payload["user_email"],
         user_mobile=payload["user_mobile"],
-        professional=pro,
+        professional=pro,  # None if unassigned
         service_type=service_type,
         booking_date=booking_date,
         booking_time=booking_time,
@@ -679,37 +662,35 @@ def booking_create(request):
     booking.calculate_pricing()
     booking.save()
 
-    # 2. Find or create professional in services app
-    from services.models import Professional as ServiceProfessional
+    # Sync to services.Booking — only build a ServiceProfessional if one was assigned
+    service_pro_id = None
+    if pro is not None:
+        from services.models import Professional as ServiceProfessional
 
-    service_pro = ServiceProfessional.objects.filter(
-        name=pro.name,
-        specialty=pro.specialty
-    ).first()
-
-    if not service_pro:
-        service_pro = ServiceProfessional.objects.create(
+        service_pro = ServiceProfessional.objects.filter(
             name=pro.name,
-            specialty=pro.specialty,
-            rating=pro.rating,
-            jobs_count=pro.jobs_done,
-            avatar=pro.avatar
-        )
-        print(f"Created service professional: {service_pro.name} with ID {service_pro.id}")
+            specialty=pro.specialty
+        ).first()
 
-    # 3. Use the AUTHENTICATED user directly
-    matched_user = request.user
+        if not service_pro:
+            service_pro = ServiceProfessional.objects.create(
+                name=pro.name,
+                specialty=pro.specialty,
+                rating=pro.rating,
+                jobs_count=pro.jobs_done,
+                avatar=pro.avatar
+            )
+        service_pro_id = service_pro.id
 
     combined_datetime = datetime.combine(booking.booking_date, booking.booking_time)
     if combined_datetime.tzinfo is None:
         combined_datetime = make_aware(combined_datetime)
 
-    # 4. Create the service booking record, linked to the authenticated user
     ServiceBooking.objects.create(
         booking_number=booking.booking_code,
-        user_id=matched_user.id,
+        user_id=request.user.id,
         service_type=booking.service_type,
-        professional_id=service_pro.id,
+        professional_id=service_pro_id,  # None if unassigned (requires nullable FK there too)
         scheduled_at=combined_datetime,
         duration_minutes=45,
         location_name=booking.area,
@@ -722,13 +703,37 @@ def booking_create(request):
         payment_method=booking.get_payment_method_display()
     )
 
+    message = "Booking created successfully."
+    if is_unassigned:
+        message = "Booking created successfully. No professional has been assigned yet."
+
     return Response({
         "status": "success",
-        "message": "Booking created successfully.",
+        "message": message,
         "data": serialize_booking(booking, request),
     }, status=201)
-
 def serialize_booking(booking, request=None):
+    if booking.professional is not None:
+        professional_data = {
+            "id": booking.professional.id,
+            "name": booking.professional.name,
+            "specialty": booking.professional.specialty,
+            "rating": float(booking.professional.rating),
+            "jobs_done": booking.professional.jobs_done,
+            "phone": booking.professional.phone,
+            "assigned": True,
+        }
+    else:
+        professional_data = {
+            "id": None,
+            "name": None,
+            "specialty": None,
+            "rating": None,
+            "jobs_done": None,
+            "phone": None,
+            "assigned": False,
+        }
+
     return {
         "id": booking.id,
         "booking_code": booking.booking_code,
@@ -738,14 +743,7 @@ def serialize_booking(booking, request=None):
             "email": booking.user_email,
             "mobile": booking.user_mobile,
         },
-        "professional": {
-            "id": booking.professional.id,
-            "name": booking.professional.name,
-            "specialty": booking.professional.specialty,
-            "rating": float(booking.professional.rating),
-            "jobs_done": booking.professional.jobs_done,
-            "phone": booking.professional.phone,
-        },
+        "professional": professional_data,
         "service": {
             "service_type_id": booking.service_type.id,
             "type_name": booking.service_type.type_name,
