@@ -28,17 +28,16 @@ class User(AbstractUser):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
-    # Fix the clash with auth.User by adding related_name
     groups = models.ManyToManyField(
         'auth.Group',
-        related_name='accounts_user_groups',  # Changed from default
+        related_name='accounts_user_groups',
         blank=True,
         help_text='The groups this user belongs to.',
         verbose_name='groups',
     )
     user_permissions = models.ManyToManyField(
         'auth.Permission',
-        related_name='accounts_user_permissions',  # Changed from default
+        related_name='accounts_user_permissions',
         blank=True,
         help_text='Specific permissions for this user.',
         verbose_name='user permissions',
@@ -80,3 +79,33 @@ class OTP(models.Model):
             otp_code=otp_code,
             expires_at=expires_at
         )
+
+
+# ============ ADMIN LOGIN MODEL ============
+class AdminLogin(models.Model):
+    """
+    Admin login table - separate from User model
+    """
+    email = models.EmailField(unique=True)
+    password = models.CharField(max_length=128)  # Django hashed password
+    name = models.CharField(max_length=100)
+    mobile_number = models.CharField(max_length=15, blank=True, null=True)
+    is_staff = models.BooleanField(default=True)
+    is_superuser = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    is_mobile_verified = models.BooleanField(default=False)
+    last_login = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'admin_login'
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"{self.email} - {self.name}"
+    
+    def set_password(self, raw_password):
+        from django.contrib.auth.hashers import make_password
+        self.password = make_password(raw_password)
+        self.save()

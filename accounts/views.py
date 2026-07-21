@@ -6,12 +6,14 @@ from django.contrib.auth import authenticate, login, logout
 from django.core.mail import send_mail
 from django.conf import settings
 from twilio.rest import Client
-from .models import User, OTP
+from .models import User, OTP, AdminLogin  # Import AdminLogin model
 from .serializers import (
     OTPSendSerializer, OTPVerifySerializer, 
     UserRegisterSerializer, UserLoginSerializer,
     UserProfileSerializer
 )
+from professionals.models import Professional
+from django.contrib.auth.hashers import check_password, make_password
 
 # ============ OTP ENDPOINTS ============
 
@@ -73,7 +75,7 @@ def send_otp(request):
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
-def verify_otp(request):
+def otp_verify(request):
     """
     Verify OTP code
     """
@@ -147,11 +149,12 @@ def login_user(request):
 
     return Response({
         'message': 'Login successful',
-        'user_id': user.id,   # <-- added, backward compatible
+        'user_id': user.id,
         'user': UserProfileSerializer(user).data,
         'access': str(refresh.access_token),
         'refresh': str(refresh),
     }, status=status.HTTP_200_OK)
+
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -278,3 +281,180 @@ def reset_password(request):
     except User.DoesNotExist:
         return Response({'error': 'User not found'}, 
                        status=status.HTTP_404_NOT_FOUND)
+
+
+# ============ ADMIN LOGIN (Using admin_login table) ============
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def admin_login(request):
+    """
+    Admin login endpoint - Uses admin_login table
+    """
+    email = request.data.get('email')
+    password = request.data.get('password')
+    
+    if not email or not password:
+        return Response({
+            'error': 'Email and password are required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    # Check admin_login table
+    try:
+        admin = AdminLogin.objects.get(email=email, is_active=True)
+        
+        # Verify password (Django hashed password)
+        if not check_password(password, admin.password):
+            return Response({
+                'error': 'Invalid credentials'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+            
+    except AdminLogin.DoesNotExist:
+        return Response({
+            'error': 'Invalid credentials or admin not found'
+        }, status=status.HTTP_401_UNAUTHORIZED)
+    
+    # Generate JWT tokens (using admin's email as identifier)
+    from rest_framework_simplejwt.tokens import RefreshToken
+    
+    # Create a dummy user object for JWT (or use actual User if exists)
+    try:
+        user = User.objects.get(email=email)
+    except User.DoesNotExist:
+        # Create a temporary user for JWT
+        user = User(
+            email=admin.email,
+            name=admin.name,
+            mobile_number=admin.mobile_number,
+            is_staff=admin.is_staff,
+            is_superuser=admin.is_superuser
+        )
+    
+    refresh = RefreshToken.for_user(user)
+    
+    return Response({
+        'status': 'success',
+        'message': 'Admin login successful',
+        'user': {
+            'id': admin.id,
+            'email': admin.email,
+            'name': admin.name,
+            'mobile_number': admin.mobile_number,
+            'is_staff': admin.is_staff,
+            'is_superuser': admin.is_superuser,
+            'role': 'admin'
+        },
+        'access': str(refresh.access_token),
+        'refresh': str(refresh),
+    }, status=status.HTTP_200_OK)
+
+
+# ============ VENDOR LOGIN (Using professionals_professional table) ============
+
+# ============ VENDOR LOGIN (Using professionals_professional table) ============
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def vendor_login(request):
+    """
+    Vendor login endpoint - Uses professionals_professional table
+    """
+    email = request.data.get('email')
+    password = request.data.get('password')
+    
+    if not email or not password:
+        return Response({
+            'error': 'Email and password are required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    # Check vendor in professionals_professional table
+    # Use filter().first() instead of get() to handle duplicates
+    professional = Professional.objects.filter(email=email, is_active=True).first()
+    
+    if not professional:
+        return Response({
+            'error': 'Invalid credentials or vendor not found'
+        }, status=status.HTTP_401_UNAUTHORIZED)
+    
+    # Verify password (Django hashed password)
+    if not check_password(password, professional.password):
+        return Response({
+            'error': 'Invalid credentials'
+        }, status=status.HTTP_401_UNAUTHORIZED)
+    
+    # Generate JWT tokens
+    from rest_framework_simplejwt.tokens import RefreshToken
+    
+    # Create a dummy user object for JWT
+    try:
+        user = User.objects.get(email=email)
+    except User.DoesNotExist:
+        # Create a temporary user for JWT
+        user = User(
+            email=professional.email,
+            name=professional.name,
+            mobile_number=professional.phone
+        )
+    
+    refresh = RefreshToken.for_user(user)
+    
+    return Response({
+        'status': 'success',
+        'message': 'Vendor login successful',
+        'user': {
+            'id': professional.id,
+            'email': professional.email,
+            'name': professional.name,
+            'mobile_number': professional.phone,
+            'role': 'vendor'
+        },
+        'professional': {
+            'id': professional.id,
+            'name': professional.name,
+            'specialty': professional.specialty,
+            'governorate': professional.governorate.name if professional.governorate else None,
+            'area': professional.area,
+            'rating': float(professional.rating),
+            'jobs_done': professional.jobs_done,
+            'is_active': professional.is_active
+        },
+        'access': str(refresh.access_token),
+        'refresh': str(refresh),
+    }, status=status.HTTP_200_OK)
+# ============ AUTO-DETECT LOGIN ============
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def login_with_role(request):
+    """
+    Unified login that determines role (admin/vendor) automatically
+    """
+    email = request.data.get('email')
+    password = request.data.get('password')
+    
+    if not email or not password:
+        return Response({
+            'error': 'Email and password are required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    # Try admin login first
+    try:
+        admin = AdminLogin.objects.get(email=email, is_active=True)
+        if check_password(password, admin.password):
+            # Admin login success
+            return admin_login(request)
+    except AdminLogin.DoesNotExist:
+        pass
+    
+    # Try vendor login
+    try:
+        professional = Professional.objects.get(email=email, is_active=True)
+        if check_password(password, professional.password):
+            # Vendor login success
+            return vendor_login(request)
+    except Professional.DoesNotExist:
+        pass
+    
+    return Response({
+        'error': 'Invalid credentials or user not found'
+    }, status=status.HTTP_401_UNAUTHORIZED)
