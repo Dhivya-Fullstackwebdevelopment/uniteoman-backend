@@ -2,12 +2,10 @@ from datetime import datetime, timedelta, date as date_cls
 import json
 import random
 import string
-
 from django.db.models import Q
 from django.http import JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
-
 from services.models import Service, ServiceType
 from .models import Professional, ProfessionalServiceType, Review, Booking
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
@@ -18,6 +16,13 @@ from django.shortcuts import get_object_or_404
 from django.db import transaction
 from django.utils.timezone import make_aware, is_naive
 from django.contrib.auth import get_user_model
+
+import csv
+from django.http import HttpResponse
+from django.db.models import Q
+from django.utils import timezone
+from .models import Booking, Professional
+from django.core.paginator import Paginator
 
 User = get_user_model()
 
@@ -905,3 +910,231 @@ def booking_book_again(request, pk):
         "message": "Booking reactivated and set to pending.",
         "data": serialize_booking(booking, request),
     }, status=200)
+
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_booking_list(request):
+    """
+    Vendor-specific booking list with status, category, and date filtering.
+    """
+    # Assuming user is linked to a Professional profile
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    queryset = Booking.objects.filter(professional=professional)
+
+    # 1. Status Filter (Today, Upcoming, Completed, Cancelled)
+    status_filter = request.GET.get('status', '').lower()
+    today = timezone.localdate()
+
+    if status_filter == 'today':
+        queryset = queryset.filter(booking_date=today)
+    elif status_filter == 'upcoming':
+        queryset = queryset.filter(booking_date__gt=today, status__in=[Booking.STATUS_SCHEDULED, Booking.STATUS_PENDING, Booking.STATUS_CONFIRMED])
+    elif status_filter == 'completed':
+        queryset = queryset.filter(status=Booking.STATUS_COMPLETED)
+    elif status_filter == 'cancelled':
+        queryset = queryset.filter(status=Booking.STATUS_CANCELLED)
+
+    # 2. Category / Service Filter
+    category_id = request.GET.get('category_id')
+    if category_id:
+        queryset = queryset.filter(service_type__service_id=category_id)
+
+    # 3. Date Filter (YYYY-MM-DD)
+    date_param = request.GET.get('date')
+    if date_param:
+        queryset = queryset.filter(booking_date=date_param)
+
+    queryset = queryset.order_by('-booking_date', '-booking_time')
+
+    data = []
+    for booking in queryset:
+        booking_datetime = timezone.datetime.combine(booking.booking_date, booking.booking_time)
+        data.append({
+            "id": booking.id,
+            "booking_code": booking.booking_code,
+            "service_name": booking.service_type.service.name if booking.service_type else "",
+            "service_type": booking.service_type.type_name if booking.service_type else "",
+            "customer_name": booking.user_name,
+            "date_time": booking_datetime.strftime('%a %d %b %I:%M %p'),
+            "location": booking.area,
+            "price": f"OMR {booking.total_amount}",
+            "status": booking.status,
+            "status_display": booking.get_status_display()
+        })
+
+    return Response({
+        "status": "success",
+        "count": len(data),
+        "data": data
+    })
+
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])  # Add IsAdminUser permissions as needed
+def admin_all_bookings(request):
+    """
+    Admin booking list with Search, Status, Area, Service filters, and CSV Export.
+    """
+    queryset = Booking.objects.all().select_related('professional', 'service_type', 'service_type__service')
+
+    # 1. Search Query (ID, Customer Name, Mobile)
+    search_query = request.GET.get('search', '').strip()
+    if search_query:
+        queryset = queryset.filter(
+            Q(booking_code__icontains=search_query) |
+            Q(user_name__icontains=search_query) |
+            Q(user_mobile__icontains=search_query)
+        )
+
+    # 2. Status Filter
+    status_filter = request.GET.get('status', '').upper()
+    if status_filter and status_filter != 'ALL':
+        if status_filter == 'UNASSIGNED':
+            queryset = queryset.filter(professional__isnull=True)
+        else:
+            queryset = queryset.filter(status=status_filter)
+
+    # 3. Area Filter
+    area = request.GET.get('area', '').strip()
+    if area:
+        queryset = queryset.filter(area__iexact=area)
+
+    # 4. Service Filter
+    service_id = request.GET.get('service_id')
+    if service_id:
+        queryset = queryset.filter(service_type__service_id=service_id)
+
+    queryset = queryset.order_by('-created_at')
+
+    # CSV Export Handler
+    if request.GET.get('export') == 'csv':
+        response = HttpResponse(content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="all_bookings.csv"'
+
+        writer = csv.writer(response)
+        writer.writerow(['Booking ID', 'Service', 'Customer', 'Professional', 'Date/Time', 'Area', 'Price (OMR)', 'Payment', 'Status'])
+
+        for b in queryset:
+            pro_name = b.professional.name if b.professional else "Unassigned"
+            b_dt = f"{b.booking_date} {b.booking_time.strftime('%H:%M')}"
+            writer.writerow([b.booking_code, b.service_type.type_name, b.user_name, pro_name, b_dt, b.area, b.total_amount, b.get_payment_method_display(), b.status])
+
+        return response
+
+    # Pagination
+    page_number = request.GET.get('page', 1)
+    page_size = request.GET.get('page_size', 20)
+    paginator = Paginator(queryset, page_size)
+    page_obj = paginator.get_page(page_number)
+
+    data = []
+    for b in page_obj:
+        data.append({
+            "id": b.id,
+            "booking_code": b.booking_code,
+            "service_name": b.service_type.type_name if b.service_type else "",
+            "customer_name": b.user_name,
+            "professional_name": b.professional.name if b.professional else "Unassigned",
+            "date": b.booking_date.strftime('%Y-%m-%d'),
+            "time": b.booking_time.strftime('%I:%M %p'),
+            "area": b.area,
+            "price": f"OMR {b.total_amount}",
+            "payment_status": "Paid" if b.payment_method != "cash_on_completion" else "Pending",
+            "status": b.status
+        })
+
+    return Response({
+        "status": "success",
+        "total_count": paginator.count,
+        "total_pages": paginator.num_pages,
+        "current_page": page_obj.number,
+        "data": data
+    })
+
+@api_view(['GET', 'POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_booking_control_assign(request, booking_id=None):
+    """
+    GET: List unassigned bookings with available vendors and AI smart routing recommendations.
+    POST: Assign or Override vendor assignment for a booking.
+    """
+    # POST: Manual / AI Confirm Assignment
+    if request.method == 'POST':
+        booking_id = request.data.get('booking_id') or booking_id
+        professional_id = request.data.get('professional_id')
+
+        if not booking_id or not professional_id:
+            return Response({"status": "error", "message": "booking_id and professional_id required."}, status=400)
+
+        booking = get_object_or_404(Booking, id=booking_id)
+        professional = get_object_or_404(Professional, id=professional_id, is_active=True)
+
+        booking.professional = professional
+        booking.status = Booking.STATUS_CONFIRMED
+        booking.save()
+
+        return Response({
+            "status": "success",
+            "message": f"Booking {booking.booking_code} assigned to {professional.name} successfully."
+        })
+
+    # GET: Dispatch Queue & Smart Routing Data
+    unassigned_bookings = Booking.objects.filter(professional__isnull=True).exclude(status=Booking.STATUS_CANCELLED)
+
+    queue_data = []
+    smart_routing_data = []
+
+    for b in unassigned_bookings:
+        # Find matching active professionals offering this service
+        available_pros = Professional.objects.filter(
+            offerings__service_type=b.service_type,
+            offerings__is_active=True,
+            is_active=True
+        ).distinct()
+
+        pros_list = []
+        for p in available_pros:
+            pros_list.append({
+                "id": p.id,
+                "name": p.name,
+                "rating": float(p.rating),
+                "distance_km": float(p.distance_km),
+                "ai_score": p.ai_match_score(b.service_type)
+            })
+
+        queue_data.append({
+            "booking_id": b.id,
+            "booking_code": b.booking_code,
+            "service_name": b.service_type.type_name,
+            "customer_name": b.user_name,
+            "area": b.area,
+            "time": b.booking_time.strftime('%I:%M %p'),
+            "price": f"OMR {b.total_amount}",
+            "available_vendors_count": len(pros_list),
+            "available_vendors": pros_list
+        })
+
+        # Calculate AI Top Pick for Smart Routing panel
+        if pros_list:
+            top_pick = max(pros_list, key=lambda x: x['ai_score'])
+            smart_routing_data.append({
+                "booking_id": b.id,
+                "customer_name": b.user_name,
+                "recommended_vendor_id": top_pick['id'],
+                "recommended_vendor_name": top_pick['name'],
+                "ai_score": top_pick['ai_score'],
+                "reason": f"Closest distance ({top_pick['distance_km']}km) and highest rating ({top_pick['rating']}★)"
+            })
+
+    return Response({
+        "status": "success",
+        "unassigned_count": len(queue_data),
+        "unassigned_queue": queue_data,
+        "ai_smart_routing": smart_routing_data
+    })

@@ -131,6 +131,7 @@ def service_list(request):
 
 
 # 2. BOOKINGS AGGREGATION FILTER (Upcoming, Ongoing, Completed, Cancelled)
+# 2. BOOKINGS AGGREGATION FILTER (Upcoming, Ongoing, Completed, Cancelled)
 @api_view(['GET'])
 @authentication_classes([JWTAuthentication])
 @permission_classes([IsAuthenticated])
@@ -139,22 +140,19 @@ def my_bookings(request):
     Get bookings for the CURRENT AUTHENTICATED user with status filtering.
     Filter options: upcoming, ongoing, completed, cancelled
     """
-    # Get the user's email to match with professionals.Booking
     user_email = request.user.email
-    
-    # Always scope to the authenticated user — never trust a user_id from the frontend.
     queryset = ProBooking.objects.filter(user_email=user_email)
 
     status_filter = request.GET.get('filter', 'upcoming').lower()
 
     if status_filter == 'upcoming':
-        queryset = queryset.filter(status__in=['pending', 'confirmed'])
+        queryset = queryset.filter(status__in=['SCHEDULED', 'PENDING', 'CONFIRMED'])
     elif status_filter == 'ongoing':
-        queryset = queryset.filter(status='ongoing')
+        queryset = queryset.filter(status__in=['EN_ROUTE', 'ARRIVED', 'IN_PROGRESS'])
     elif status_filter == 'completed':
-        queryset = queryset.filter(status='completed')
+        queryset = queryset.filter(status='COMPLETED')
     elif status_filter == 'cancelled':
-        queryset = queryset.filter(status='cancelled')
+        queryset = queryset.filter(status='CANCELLED')
 
     queryset = queryset.order_by('-created_at')
 

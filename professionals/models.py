@@ -84,18 +84,38 @@ class Review(models.Model):
         return f"{self.reviewer_name} -> {self.professional.name} ({self.rating}★)"
 
 
+# class Booking(models.Model):
+#     STATUS_PENDING = "pending"
+#     STATUS_CONFIRMED = "confirmed"
+#     STATUS_ONGOING = "ongoing"
+#     STATUS_CANCELLED = "cancelled"
+#     STATUS_COMPLETED = "completed"
+#     STATUS_CHOICES = [
+#         (STATUS_PENDING, "Pending"),
+#         (STATUS_CONFIRMED, "Confirmed"),
+#         (STATUS_ONGOING, "Ongoing"),
+#         (STATUS_CANCELLED, "Cancelled"),
+#         (STATUS_COMPLETED, "Completed"),
+#     ]
 class Booking(models.Model):
-    STATUS_PENDING = "pending"
-    STATUS_CONFIRMED = "confirmed"
-    STATUS_ONGOING = "ongoing"
-    STATUS_CANCELLED = "cancelled"
-    STATUS_COMPLETED = "completed"
+    STATUS_SCHEDULED = "SCHEDULED"
+    STATUS_PENDING = "PENDING"
+    STATUS_CONFIRMED = "CONFIRMED"
+    STATUS_EN_ROUTE = "EN_ROUTE"
+    STATUS_ARRIVED = "ARRIVED"
+    STATUS_IN_PROGRESS = "IN_PROGRESS"
+    STATUS_COMPLETED = "COMPLETED"
+    STATUS_CANCELLED = "CANCELLED"
+    
     STATUS_CHOICES = [
+        (STATUS_SCHEDULED, "Scheduled"),
         (STATUS_PENDING, "Pending"),
         (STATUS_CONFIRMED, "Confirmed"),
-        (STATUS_ONGOING, "Ongoing"),
-        (STATUS_CANCELLED, "Cancelled"),
+        (STATUS_EN_ROUTE, "En Route"),
+        (STATUS_ARRIVED, "Arrived"),
+        (STATUS_IN_PROGRESS, "In Progress"),
         (STATUS_COMPLETED, "Completed"),
+        (STATUS_CANCELLED, "Cancelled"),
     ]
 
     PAYMENT_CHOICES = [
