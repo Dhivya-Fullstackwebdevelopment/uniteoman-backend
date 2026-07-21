@@ -9,17 +9,18 @@ from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 
 from services.models import Service, ServiceType
-from services.models import Booking as ServiceBooking  # Imported for auto-syncing
 from .models import Professional, ProfessionalServiceType, Review, Booking
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.authentication import JWTAuthentication
-from services.models import Booking as ServiceBooking
-from professionals.models import Booking as ProBooking
 from django.shortcuts import get_object_or_404 
 from django.db import transaction
 from django.utils.timezone import make_aware, is_naive
+from django.contrib.auth import get_user_model
+
+User = get_user_model()
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -99,9 +100,7 @@ def build_ai_match_note(pro):
 
 
 def build_ai_summary_note(pro):
-    """Bottom banner note shown under the AI Top Picks panel, e.g.
-    'AI: Mohammed is ideal — highest AC score, 0 cancellations, available today. Avg wait: 22 min.'
-    """
+    """Bottom banner note shown under the AI Top Picks panel."""
     first_name = pro.name.split()[0] if pro.name else "This professional"
     return (
         f"{first_name} is ideal — highest match score, "
@@ -230,7 +229,6 @@ def professional_list(request):
         )
 
     # service_type_id can be a single id or a comma-separated list of ids
-    # (used when the user has multiple "Choose a Service" checkboxes selected)
     service_type_ids = []
     if service_type_id:
         service_type_ids = [int(x) for x in service_type_id.split(",") if x.strip().isdigit()]
@@ -251,19 +249,12 @@ def professional_list(request):
 
     professionals = professionals.distinct()
 
-    # Calculate exact Badge counter labels dynamically based on clean requirements.
-    # NOTE: base_qs is taken AFTER the service_id / service_type_id filter above,
-    # so count_all correctly reflects "pros available" for whatever service(s)
-    # are currently selected on the frontend (e.g. "312 pros available").
     base_qs = professionals
     count_all = base_qs.count()
     count_available_today = base_qs.filter(next_available_date=timezone.localdate()).count()
-    count_top_rated = base_qs.filter(rating__gte=4.5).count()  # Displays high ratings count
+    count_top_rated = base_qs.filter(rating__gte=4.5).count()
     count_nearest = base_qs.filter(distance_km__lte=5.0).count()
 
-    # Chip Filtering Logic handling both direct subsets and sort updates.
-    # This must run BEFORE list(professionals) below, since .filter() only
-    # works on querysets, not on plain Python lists.
     if sort == "available_today":
         professionals = professionals.filter(next_available_date=timezone.localdate())
     elif sort == "top_rated":
@@ -271,8 +262,6 @@ def professional_list(request):
     elif sort == "nearest":
         professionals = professionals.filter(distance_km__lte=5.0)
 
-    # Secondary Filter overrides (Sidebar parameters)
-    # exact match on rating (e.g. ?rating=4.9)
     if min_rating_param:
         try:
             professionals = professionals.filter(rating=float(min_rating_param))
@@ -295,12 +284,6 @@ def professional_list(request):
                 pass
         professionals = professionals.filter(price_filter).distinct()
 
-    # Order processing depending on current sorting chip.
-    # NOTE: sorting is done in Python (not via .order_by() on the queryset) because
-    # the queryset already has .distinct() applied from the service_type_id join filter.
-    # Combining .distinct() with .order_by() on a different field is unreliable across
-    # databases (e.g. Postgres requires ORDER BY fields to match DISTINCT fields) — this
-    # was why "nearest" and "lowest_price" sometimes silently ignored the requested order.
     professionals = list(professionals)
 
     if sort == "nearest":
@@ -325,7 +308,6 @@ def professional_list(request):
         for p in professionals
     ]
 
-    # Render top matches (AI Top Picks panel)
     ranked = sorted(professionals, key=lambda p: p.ai_match_score(service_type), reverse=True)[:3]
     ai_top_picks = []
     for idx, p in enumerate(ranked):
@@ -334,8 +316,6 @@ def professional_list(request):
         card["ai_match_note"] = build_ai_match_note(p)
         ai_top_picks.append(card)
 
-    # Bottom AI summary banner, e.g.
-    # "AI: Mohammed is ideal — highest AC score, 0 cancellations, available today. Avg wait: 22 min."
     ai_summary_note = build_ai_summary_note(ranked[0]) if ranked else None
 
     response = {
@@ -354,7 +334,6 @@ def professional_list(request):
         "data": cards,
     }
 
-    # Optional diagnostics: ?debug=1
     if request.GET.get("debug") == "1":
         all_offerings = []
         if service_type_ids:
@@ -413,8 +392,6 @@ def professional_detail(request, pk):
 
     data = serialize_professional_detail(pro, request)
 
-    # service_type ids this professional offers -> used to find how many other
-    # pros offer the SAME service(s), and to build the AI Top Picks panel.
     offered_service_type_ids = list(
         pro.offerings.filter(is_active=True).values_list("service_type_id", flat=True)
     )
@@ -516,10 +493,8 @@ def area_list(request):
     })
 
 # ---------------------------------------------------------------------------
-# POST /api/bookings/create/ (Sync Integrated Natively Here)
+# POST /api/bookings/create/
 # ---------------------------------------------------------------------------
-
-# In professionals/views.py - Fixed booking_create function
 
 @api_view(['POST'])
 @authentication_classes([JWTAuthentication])
@@ -546,7 +521,6 @@ def booking_create(request):
             "message": f"Missing required fields: {', '.join(missing)}",
         }, status=400)
 
-    # --- professional_id is OPTIONAL. Not sent / null / "" / 0 -> unassigned (NULL). ---
     raw_professional_id = payload.get("professional_id", 0)
     if raw_professional_id in (None, ""):
         raw_professional_id = 0
@@ -579,7 +553,6 @@ def booking_create(request):
             "message": "Service type not found."
         }, status=404)
 
-    # Check if professional offers this service (skip when unassigned)
     if is_unassigned:
         service_fee = service_type.price
     else:
@@ -622,23 +595,19 @@ def booking_create(request):
             }, status=409)
 
     # Check duplicate booking for this user at the same datetime
-    combined_dt = datetime.combine(booking_date, booking_time)
-    if is_naive(combined_dt):
-        combined_dt = make_aware(combined_dt)
-
-    duplicate_booking = ServiceBooking.objects.filter(
-        user_id=request.user.id,
-        scheduled_at=combined_dt,
-    ).exclude(status__in=["CANCELLED", "COMPLETED"]).first()
+    duplicate_booking = Booking.objects.filter(
+        user_email=payload["user_email"],
+        booking_date=booking_date,
+        booking_time=booking_time,
+    ).exclude(status__in=["cancelled", "completed"]).first()
 
     if duplicate_booking:
-        existing_local_dt = timezone.localtime(duplicate_booking.scheduled_at)
         return Response({
             "status": "error",
-            "message": f"You already have a booking at {existing_local_dt.strftime('%I:%M %p').lstrip('0')} on {existing_local_dt.strftime('%d %b %Y')}. Please choose a different time slot."
+            "message": f"You already have a booking at {booking_time.strftime('%I:%M %p').lstrip('0')} on {booking_date.strftime('%d %b %Y')}. Please choose a different time slot."
         }, status=409)
 
-    # Create booking — professional is None when unassigned
+    # Create booking using professionals.Booking
     booking = Booking(
         user_name=payload["user_name"],
         user_email=payload["user_email"],
@@ -662,47 +631,6 @@ def booking_create(request):
     booking.calculate_pricing()
     booking.save()
 
-    # Sync to services.Booking — only build a ServiceProfessional if one was assigned
-    service_pro_id = None
-    if pro is not None:
-        from services.models import Professional as ServiceProfessional
-
-        service_pro = ServiceProfessional.objects.filter(
-            name=pro.name,
-            specialty=pro.specialty
-        ).first()
-
-        if not service_pro:
-            service_pro = ServiceProfessional.objects.create(
-                name=pro.name,
-                specialty=pro.specialty,
-                rating=pro.rating,
-                jobs_count=pro.jobs_done,
-                avatar=pro.avatar
-            )
-        service_pro_id = service_pro.id
-
-    combined_datetime = datetime.combine(booking.booking_date, booking.booking_time)
-    if combined_datetime.tzinfo is None:
-        combined_datetime = make_aware(combined_datetime)
-
-    ServiceBooking.objects.create(
-        booking_number=booking.booking_code,
-        user_id=request.user.id,
-        service_type=booking.service_type,
-        professional_id=service_pro_id,  # None if unassigned (requires nullable FK there too)
-        scheduled_at=combined_datetime,
-        duration_minutes=45,
-        location_name=booking.area,
-        address=f"{booking.villa_apartment_no}, {booking.street_name}, {booking.nearest_landmark}".strip(', '),
-        status=booking.status.upper(),
-        service_fee=booking.service_fee,
-        platform_fee=booking.platform_fee,
-        vat=booking.vat_amount,
-        total_paid=booking.total_amount,
-        payment_method=booking.get_payment_method_display()
-    )
-
     message = "Booking created successfully."
     if is_unassigned:
         message = "Booking created successfully. No professional has been assigned yet."
@@ -712,6 +640,8 @@ def booking_create(request):
         "message": message,
         "data": serialize_booking(booking, request),
     }, status=201)
+
+
 def serialize_booking(booking, request=None):
     if booking.professional is not None:
         professional_data = {
@@ -814,7 +744,7 @@ def booking_confirm(request, pk):
 
     return JsonResponse({
         "status": "success",
-        "message": f"{booking.professional.name} is confirmed. SMS + WhatsApp sent to {booking.user_mobile}.",
+        "message": f"{booking.professional.name if booking.professional else 'Professional'} is confirmed. SMS + WhatsApp sent to {booking.user_mobile}.",
         "data": serialize_booking(booking, request),
     })
 
@@ -824,48 +754,41 @@ def booking_confirm(request, pk):
 # ---------------------------------------------------------------------------
 
 @csrf_exempt
-def service_booking_cancel(request, service_booking_id):
+def booking_cancel(request, pk):
     if request.method != "POST":
         return JsonResponse({"status": "error", "message": "POST required."}, status=405)
 
     try:
-        service_booking = ServiceBooking.objects.get(pk=service_booking_id)
-    except ServiceBooking.DoesNotExist:
-        return JsonResponse({"status": "error", "message": "Service booking not found."}, status=404)
+        booking = Booking.objects.get(pk=pk)
+    except Booking.DoesNotExist:
+        return JsonResponse({"status": "error", "message": "Booking not found."}, status=404)
 
-    if service_booking.status == "CANCELLED":
+    if booking.status == Booking.STATUS_CANCELLED:
         return JsonResponse({
             "status": "error",
             "message": "Booking already cancelled.",
         }, status=400)
 
-    # find matching professionals.Booking using booking_number <-> booking_code
-    pro_booking = Booking.objects.filter(booking_code=service_booking.booking_number).first()
-
-    if pro_booking:
-        if pro_booking.status not in (Booking.STATUS_CANCELLED, Booking.STATUS_COMPLETED):
-            pro_booking.status = Booking.STATUS_CANCELLED
-            pro_booking.save(update_fields=["status", "updated_at"])
-
-    service_booking.status = "CANCELLED"
-    service_booking.save(update_fields=["status"])
+    booking.status = Booking.STATUS_CANCELLED
+    booking.save(update_fields=["status", "updated_at"])
 
     return JsonResponse({
         "status": "success",
         "message": "Booking cancelled.",
-        "data": {
-            "service_booking_id": service_booking.id,
-            "booking_number": service_booking.booking_number,
-            "status": service_booking.status,
-        },
+        "data": serialize_booking(booking, request),
     })
+
+
+# ---------------------------------------------------------------------------
+# POST /api/bookings/<id>/reschedule/
+# ---------------------------------------------------------------------------
 
 @api_view(['POST'])
 @authentication_classes([JWTAuthentication])
 @permission_classes([IsAuthenticated])
-def reschedule_booking(request, service_booking_id):
+def reschedule_booking(request, pk):
     """
-    Safely reschedules a booking for both the professional and services apps.
+    Safely reschedules a booking.
     Expects payload: {"booking_date": "YYYY-MM-DD", "booking_time": "HH:MM"}
     """
     payload = request.data
@@ -878,24 +801,22 @@ def reschedule_booking(request, service_booking_id):
             "message": "Missing required fields: booking_date and booking_time are required."
         }, status=400)
 
-    # 1. Fetch the main client service booking record (Ensure ownership)
-    service_booking = get_object_or_404(ServiceBooking, id=service_booking_id, user=request.user)
-
-    if service_booking.status in ['CANCELLED', 'COMPLETED']:
+    # Fetch the booking (ensure ownership via email)
+    try:
+        booking = Booking.objects.get(pk=pk, user_email=request.user.email)
+    except Booking.DoesNotExist:
         return Response({
             "status": "error",
-            "message": f"Cannot reschedule a booking that is already {service_booking.status.lower()}."
-        }, status=400)
-
-    # 2. Fetch the corresponding internal professional app booking record
-    pro_booking = ProBooking.objects.filter(booking_code=service_booking.booking_number).first()
-    if not pro_booking:
-        return Response({
-            "status": "error",
-            "message": "Associated professional booking record could not be found."
+            "message": "Booking not found or you don't have permission."
         }, status=404)
 
-    # 3. Parse input values
+    if booking.status in ['cancelled', 'completed']:
+        return Response({
+            "status": "error",
+            "message": f"Cannot reschedule a booking that is already {booking.status}."
+        }, status=400)
+
+    # Parse input values
     try:
         new_booking_date = datetime.strptime(new_date_str, "%Y-%m-%d").date()
         new_booking_time = datetime.strptime(new_time_str, "%H:%M").time()
@@ -905,33 +826,27 @@ def reschedule_booking(request, service_booking_id):
             "message": "Invalid format. Use booking_date=YYYY-MM-DD, booking_time=HH:MM."
         }, status=400)
 
-    # 4. Generate timezone aware datetimes for clash checking
-   
-    from django.utils.timezone import make_aware, is_naive
+    # Check professional availability (if assigned)
+    if booking.professional:
+        pro_clash = Booking.objects.filter(
+            professional=booking.professional,
+            booking_date=new_booking_date,
+            booking_time=new_booking_time,
+            status__in=[Booking.STATUS_PENDING, Booking.STATUS_CONFIRMED]
+        ).exclude(id=booking.id).exists()
 
-    combined_dt = datetime.combine(new_booking_date, new_booking_time)
-    if is_naive(combined_dt):
-        combined_dt = make_aware(combined_dt)
+        if pro_clash:
+            return Response({
+                "status": "error",
+                "message": f"{booking.professional.name} is already booked at {new_booking_time.strftime('%I:%M %p').lstrip('0')} on this date."
+            }, status=409)
 
-    # Check 1: Absolute Professional Availability Clash Guard (Exclude current booking)
-    pro_clash = ProBooking.objects.filter(
-        professional=pro_booking.professional,
+    # Check user duplicate booking
+    user_clash = Booking.objects.filter(
+        user_email=request.user.email,
         booking_date=new_booking_date,
         booking_time=new_booking_time,
-        status__in=[ProBooking.STATUS_PENDING, ProBooking.STATUS_CONFIRMED]
-    ).exclude(id=pro_booking.id).exists()
-
-    if pro_clash:
-        return Response({
-            "status": "error",
-            "message": f"{pro_booking.professional.name} is already booked at {new_booking_time.strftime('%I:%M %p').lstrip('0')} on this date."
-        }, status=409)
-
-    # Check 2: User Duplicate Booking Guard (Exclude current booking)
-    user_clash = ServiceBooking.objects.filter(
-        user_id=request.user.id,
-        scheduled_at=combined_dt
-    ).exclude(status__in=["CANCELLED", "COMPLETED"]).exclude(id=service_booking.id).first()
+    ).exclude(status__in=["cancelled", "completed"]).exclude(id=booking.id).first()
 
     if user_clash:
         return Response({
@@ -939,65 +854,54 @@ def reschedule_booking(request, service_booking_id):
             "message": "You already have another active service scheduled at this exact time."
         }, status=409)
 
-    # 5. Atomically update both booking objects
-    with transaction.atomic():
-        # Update professional tracking record
-        pro_booking.booking_date = new_booking_date
-        pro_booking.booking_time = new_booking_time
-        # Revert back to pending status if it was confirmed to let them re-verify
-        pro_booking.status = ProBooking.STATUS_PENDING 
-        pro_booking.save(update_fields=["booking_date", "booking_time", "status", "updated_at"])
-
-        # Update service engine tracking record
-        service_booking.scheduled_at = combined_dt
-        service_booking.status = "PENDING"
-        service_booking.save(update_fields=["scheduled_at", "status"])
+    # Update booking
+    booking.booking_date = new_booking_date
+    booking.booking_time = new_booking_time
+    booking.status = Booking.STATUS_PENDING
+    booking.save(update_fields=["booking_date", "booking_time", "status", "updated_at"])
 
     return Response({
         "status": "success",
-        "message": "Booking successfully rescheduled to {new_booking_date} at {new_booking_time.strftime('%I:%M %p').lstrip('0')}.",
+        "message": f"Booking successfully rescheduled to {new_booking_date} at {new_booking_time.strftime('%I:%M %p').lstrip('0')}.",
         "data": {
-            "booking_number": service_booking.booking_number,
-            "new_scheduled_at": service_booking.scheduled_at.strftime('%Y-%m-%d %H:%M'),
-            "status": service_booking.status
+            "booking_number": booking.booking_code,
+            "new_date": booking.booking_date.strftime('%Y-%m-%d'),
+            "new_time": booking.booking_time.strftime('%H:%M'),
+            "status": booking.status
         }
     }, status=200)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/bookings/<id>/book-again/
+# ---------------------------------------------------------------------------
 
 @api_view(['POST'])
 @authentication_classes([JWTAuthentication])
 @permission_classes([IsAuthenticated])
-def booking_book_again(request, service_booking_id):
+def booking_book_again(request, pk):
     """
     Reactivates a cancelled booking by flipping its status back to PENDING.
-    Does not create a new booking record.
     """
-    # 1. Fetch the cancelled service booking (must belong to this user)
-    service_booking = get_object_or_404(ServiceBooking, id=service_booking_id, user=request.user)
+    try:
+        booking = Booking.objects.get(pk=pk, user_email=request.user.email)
+    except Booking.DoesNotExist:
+        return Response({
+            "status": "error",
+            "message": "Booking not found or you don't have permission."
+        }, status=404)
 
-    if service_booking.status != "CANCELLED":
+    if booking.status != Booking.STATUS_CANCELLED:
         return Response({
             "status": "error",
             "message": "Only cancelled bookings can be booked again."
         }, status=400)
 
-    # 2. Find the matching professional-app booking record
-    pro_booking = ProBooking.objects.filter(booking_code=service_booking.booking_number).first()
-    if not pro_booking:
-        return Response({
-            "status": "error",
-            "message": "Associated professional booking record could not be found."
-        }, status=404)
-
-    # 3. Atomically flip both records back to pending
-    with transaction.atomic():
-        pro_booking.status = ProBooking.STATUS_PENDING
-        pro_booking.save(update_fields=["status", "updated_at"])
-
-        service_booking.status = "PENDING"
-        service_booking.save(update_fields=["status"])
+    booking.status = Booking.STATUS_PENDING
+    booking.save(update_fields=["status", "updated_at"])
 
     return Response({
         "status": "success",
         "message": "Booking reactivated and set to pending.",
-        "data": serialize_booking(pro_booking, request),
+        "data": serialize_booking(booking, request),
     }, status=200)

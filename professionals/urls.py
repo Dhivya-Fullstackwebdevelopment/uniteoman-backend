@@ -2,7 +2,6 @@ from django.urls import path
 from . import views
 
 urlpatterns = [
-
     # Professional List + Filters
     path("", views.professional_list),
 
@@ -15,15 +14,14 @@ urlpatterns = [
     # Area List
     path("areas/", views.area_list),
 
-    # Booking
+    # Service Types
+    path("service-types/", views.service_type_list),
+
+    # Bookings
     path("bookings/create/", views.booking_create),
-
     path("bookings/<int:pk>/", views.booking_detail),
-
     path("bookings/<int:pk>/confirm/", views.booking_confirm),
-
-    # path("bookings/<int:pk>/cancel/", views.booking_cancel),
-    path("bookings/<int:service_booking_id>/cancel/", views.service_booking_cancel),
-    path("bookings/<int:service_booking_id>/reschedule/", views.reschedule_booking, name="reschedule_booking_api"),
-    path("bookings/<int:service_booking_id>/book-again/", views.booking_book_again, name="booking_book_again"),
+    path("bookings/<int:pk>/cancel/", views.booking_cancel),
+    path("bookings/<int:pk>/reschedule/", views.reschedule_booking, name="reschedule_booking_api"),
+    path("bookings/<int:pk>/book-again/", views.booking_book_again, name="booking_book_again"),
 ]

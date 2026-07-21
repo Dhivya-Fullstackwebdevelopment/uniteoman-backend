@@ -10,7 +10,11 @@ from rest_framework.decorators import api_view, authentication_classes, permissi
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.authentication import JWTAuthentication
-from .models import Service, ServiceType, Booking, Review
+from .models import Service, ServiceType
+from professionals.models import Booking as ProBooking, Professional as ProProfessional
+from django.contrib.auth import get_user_model
+
+User = get_user_model()
 
 def service_list(request):
     # Get all query parameters
@@ -127,11 +131,6 @@ def service_list(request):
 
 
 # 2. BOOKINGS AGGREGATION FILTER (Upcoming, Ongoing, Completed, Cancelled)
-# -----------------------------------------------------------------------
-# SECURITY FIX:
-# - Login is now REQUIRED (JWT-authenticated). Anonymous requests get 401.
-# - The `user_id` query param is no longer trusted/accepted. Bookings are
-#   scoped strictly to request.user, derived from the JWT.
 @api_view(['GET'])
 @authentication_classes([JWTAuthentication])
 @permission_classes([IsAuthenticated])
@@ -140,39 +139,46 @@ def my_bookings(request):
     Get bookings for the CURRENT AUTHENTICATED user with status filtering.
     Filter options: upcoming, ongoing, completed, cancelled
     """
+    # Get the user's email to match with professionals.Booking
+    user_email = request.user.email
+    
     # Always scope to the authenticated user — never trust a user_id from the frontend.
-    queryset = Booking.objects.filter(user=request.user)
+    queryset = ProBooking.objects.filter(user_email=user_email)
 
     status_filter = request.GET.get('filter', 'upcoming').lower()
 
     if status_filter == 'upcoming':
-        queryset = queryset.filter(status__in=['SCHEDULED', 'EN_ROUTE', 'confirmed', 'pending'])
+        queryset = queryset.filter(status__in=['pending', 'confirmed'])
     elif status_filter == 'ongoing':
-        queryset = queryset.filter(status__in=['ARRIVED', 'IN_PROGRESS'])
+        queryset = queryset.filter(status='ongoing')
     elif status_filter == 'completed':
-        queryset = queryset.filter(status='COMPLETED')
+        queryset = queryset.filter(status='completed')
     elif status_filter == 'cancelled':
-        queryset = queryset.filter(status='CANCELLED')
+        queryset = queryset.filter(status='cancelled')
 
-    queryset = queryset.order_by('-scheduled_at')
+    queryset = queryset.order_by('-created_at')
 
     data = []
     for booking in queryset:
         professional_name = booking.professional.name if booking.professional else "Not Assigned"
+        
+        # Format the date/time
+        booking_datetime = timezone.datetime.combine(booking.booking_date, booking.booking_time)
+        formatted_datetime = booking_datetime.strftime('%a %d %b · %I:%M %p')
 
         data.append({
             "id": booking.id,
-            "booking_number": booking.booking_number,
+            "booking_number": booking.booking_code,
             "service_name": booking.service_type.type_name if booking.service_type else "Unknown Service",
             "professional_name": professional_name,
-            "date_time": booking.scheduled_at.strftime('%a %d %b · %I:%M %p') if booking.scheduled_at else "Not Scheduled",
-            "location": booking.location_name,
-            "address": booking.address,
-            "price": str(booking.total_paid),
-            "status": booking.get_status_display() if hasattr(booking, 'get_status_display') else booking.status,
+            "date_time": formatted_datetime,
+            "location": booking.area,
+            "address": f"{booking.villa_apartment_no}, {booking.street_name}",
+            "price": str(booking.total_amount),
+            "status": booking.get_status_display(),
             "status_code": booking.status,
-            "payment_method": booking.payment_method,
-            "duration_minutes": booking.duration_minutes
+            "payment_method": booking.get_payment_method_display(),
+            "duration_minutes": 45  # Default duration
         })
 
     return Response({
@@ -191,13 +197,15 @@ def track_booking(request, booking_id):
     """
     Track a specific booking by ID — must belong to the authenticated user.
     """
-    booking = get_object_or_404(Booking, id=booking_id, user=request.user)
+    booking = get_object_or_404(ProBooking, id=booking_id, user_email=request.user.email)
 
     from datetime import datetime, timedelta
     current_time = datetime.now()
-
-    if booking.scheduled_at:
-        time_diff = (booking.scheduled_at - current_time).total_seconds() / 60
+    
+    booking_datetime = timezone.datetime.combine(booking.booking_date, booking.booking_time)
+    
+    if booking_datetime:
+        time_diff = (booking_datetime - current_time).total_seconds() / 60
         eta_minutes = max(5, int(time_diff)) if time_diff > 0 else 12
     else:
         eta_minutes = 12
@@ -205,16 +213,16 @@ def track_booking(request, booking_id):
     return Response({
         "status": "success",
         "booking_id": booking.id,
-        "booking_number": booking.booking_number,
+        "booking_number": booking.booking_code,
         "status_code": booking.status,
-        "status_display": booking.get_status_display() if hasattr(booking, 'get_status_display') else booking.status,
+        "status_display": booking.get_status_display(),
         "eta_minutes": eta_minutes,
         "distance_away_km": 1.2,
-        "arriving_at": (booking.scheduled_at + timedelta(minutes=12)).strftime('%I:%M %p') if booking.scheduled_at else "10:12 AM",
+        "arriving_at": (booking_datetime + timedelta(minutes=12)).strftime('%I:%M %p') if booking_datetime else "10:12 AM",
         "service_type": booking.service_type.type_name if booking.service_type else "Unknown",
         "professional": booking.professional.name if booking.professional else "Not Assigned",
-        "location": booking.location_name,
-        "address": booking.address
+        "location": booking.area,
+        "address": f"{booking.villa_apartment_no}, {booking.street_name}"
     })
 
 
@@ -227,7 +235,7 @@ def rate_booking(request, booking_id):
     Submit a review for a booking — must belong to the authenticated user.
     """
     try:
-        booking = get_object_or_404(Booking, id=booking_id, user=request.user)
+        booking = get_object_or_404(ProBooking, id=booking_id, user_email=request.user.email)
 
         body = request.data
 
@@ -238,12 +246,22 @@ def rate_booking(request, booking_id):
                 "message": "Rating must be between 1 and 5"
             }, status=400)
 
-        review, created = Review.objects.update_or_create(
-            booking=booking,
+        # Check if booking has a professional to review
+        if not booking.professional:
+            return Response({
+                "status": "error",
+                "message": "Cannot review a booking without an assigned professional"
+            }, status=400)
+
+        # Create or update review using professionals.Review model
+        from professionals.models import Review as ProReview
+        
+        review, created = ProReview.objects.update_or_create(
+            professional=booking.professional,
+            reviewer_name=booking.user_name,
             defaults={
                 'rating': rating,
-                'review_text': body.get('review_text', ''),
-                'tags': body.get('tags', [])
+                'comment': body.get('review_text', ''),
             }
         )
 
@@ -254,10 +272,10 @@ def rate_booking(request, booking_id):
             "created": created,
             "data": {
                 "booking_id": booking.id,
-                "booking_number": booking.booking_number,
+                "booking_number": booking.booking_code,
                 "rating": review.rating,
-                "review_text": review.review_text,
-                "tags": review.tags
+                "review_text": review.comment,
+                "tags": []  # Tags are not in professionals.Review model
             }
         })
 
@@ -276,26 +294,26 @@ def booking_receipt(request, booking_id):
     """
     Get receipt data for a specific booking — must belong to the authenticated user.
     """
-    booking = get_object_or_404(Booking, id=booking_id, user=request.user)
+    booking = get_object_or_404(ProBooking, id=booking_id, user_email=request.user.email)
 
     return Response({
         "status": "success",
         "data": {
             "booking_id": booking.id,
-            "booking_number": booking.booking_number,
+            "booking_number": booking.booking_code,
             "service_name": booking.service_type.type_name if booking.service_type else "Unknown Service",
             "professional": booking.professional.name if booking.professional else "Not Assigned",
             "service_fee": str(booking.service_fee),
             "platform_fee": str(booking.platform_fee),
-            "vat": str(booking.vat),
-            "total_paid": str(booking.total_paid),
-            "payment_method": booking.payment_method,
+            "vat": str(booking.vat_amount),
+            "total_paid": str(booking.total_amount),
+            "payment_method": booking.get_payment_method_display(),
             "booking_date": booking.created_at.strftime('%Y-%m-%d %H:%M') if booking.created_at else None,
-            "scheduled_at": booking.scheduled_at.strftime('%Y-%m-%d %H:%M') if booking.scheduled_at else None,
+            "scheduled_at": timezone.datetime.combine(booking.booking_date, booking.booking_time).strftime('%Y-%m-%d %H:%M') if booking.booking_date and booking.booking_time else None,
             "status": booking.status,
-            "location": booking.location_name,
-            "address": booking.address,
-            "duration_minutes": booking.duration_minutes
+            "location": booking.area,
+            "address": f"{booking.villa_apartment_no}, {booking.street_name}",
+            "duration_minutes": 45
         }
     })
 
@@ -308,7 +326,7 @@ def download_receipt_pdf(request, booking_id):
     """
     Download receipt as PDF — must belong to the authenticated user.
     """
-    booking = get_object_or_404(Booking, id=booking_id, user=request.user)
+    booking = get_object_or_404(ProBooking, id=booking_id, user_email=request.user.email)
 
     try:
         from reportlab.lib.pagesizes import letter
@@ -347,17 +365,19 @@ def download_receipt_pdf(request, booking_id):
     )
 
     story.append(Paragraph("Invoice", title_style))
-    story.append(Paragraph(f"Booking #{booking.booking_number}", subtitle_style))
+    story.append(Paragraph(f"Booking #{booking.booking_code}", subtitle_style))
     story.append(Spacer(1, 10))
 
+    booking_datetime = timezone.datetime.combine(booking.booking_date, booking.booking_time) if booking.booking_date and booking.booking_time else None
+    
     booking_data = [
-        ["Booking Number:", booking.booking_number],
+        ["Booking Number:", booking.booking_code],
         ["Date:", booking.created_at.strftime('%Y-%m-%d %H:%M') if booking.created_at else "N/A"],
         ["Service:", booking.service_type.type_name if booking.service_type else "Unknown"],
         ["Professional:", booking.professional.name if booking.professional else "Not Assigned"],
-        ["Location:", booking.location_name],
-        ["Address:", booking.address],
-        ["Status:", booking.get_status_display() if hasattr(booking, 'get_status_display') else booking.status],
+        ["Location:", booking.area],
+        ["Address:", f"{booking.villa_apartment_no}, {booking.street_name}"],
+        ["Status:", booking.get_status_display()],
     ]
 
     t1 = Table(booking_data, colWidths=[150, 300])
@@ -378,8 +398,8 @@ def download_receipt_pdf(request, booking_id):
         ["Description", "Amount (OMR)"],
         ["Service Fee", f"{booking.service_fee}"],
         ["Platform Fee", f"{booking.platform_fee}"],
-        ["VAT (9%)", f"{booking.vat}"],
-        ["Total Paid", f"{booking.total_paid}"]
+        ["VAT (9%)", f"{booking.vat_amount}"],
+        ["Total Paid", f"{booking.total_amount}"]
     ]
 
     t2 = Table(invoice_data, colWidths=[200, 150])
@@ -400,7 +420,7 @@ def download_receipt_pdf(request, booking_id):
     story.append(t2)
     story.append(Spacer(1, 20))
 
-    story.append(Paragraph(f"Payment Method: {booking.payment_method}", styles['Normal']))
+    story.append(Paragraph(f"Payment Method: {booking.get_payment_method_display()}", styles['Normal']))
     story.append(Spacer(1, 10))
 
     # Center aligned bottom greeting style
@@ -416,5 +436,5 @@ def download_receipt_pdf(request, booking_id):
 
     buffer.seek(0)
     response = HttpResponse(buffer, content_type='application/pdf')
-    response['Content-Disposition'] = f'attachment; filename="Invoice_{booking.booking_number}.pdf"'
+    response['Content-Disposition'] = f'attachment; filename="Invoice_{booking.booking_code}.pdf"'
     return response
