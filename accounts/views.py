@@ -349,10 +349,6 @@ def admin_login(request):
     }, status=status.HTTP_200_OK)
 
 
-# ============ VENDOR LOGIN (Using professionals_professional table) ============
-
-# ============ VENDOR LOGIN (Using professionals_professional table) ============
-
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def vendor_login(request):
@@ -368,7 +364,6 @@ def vendor_login(request):
         }, status=status.HTTP_400_BAD_REQUEST)
     
     # Check vendor in professionals_professional table
-    # Use filter().first() instead of get() to handle duplicates
     professional = Professional.objects.filter(email=email, is_active=True).first()
     
     if not professional:
@@ -376,8 +371,25 @@ def vendor_login(request):
             'error': 'Invalid credentials or vendor not found'
         }, status=status.HTTP_401_UNAUTHORIZED)
     
-    # Verify password (Django hashed password)
-    if not check_password(password, professional.password):
+    # Check if password is set
+    if not professional.password:
+        return Response({
+            'error': 'Password not set for this vendor. Please contact support.'
+        }, status=status.HTTP_401_UNAUTHORIZED)
+    
+    # Verify password - Check both hashed and plain text
+    password_valid = False
+    
+    # Check if it's a Django hashed password (starts with pbkdf2_sha256)
+    if professional.password.startswith('pbkdf2_sha256'):
+        # Use Django's check_password for hashed passwords
+        from django.contrib.auth.hashers import check_password
+        password_valid = check_password(password, professional.password)
+    else:
+        # For plain text passwords (development/testing)
+        password_valid = (professional.password == password)
+    
+    if not password_valid:
         return Response({
             'error': 'Invalid credentials'
         }, status=status.HTTP_401_UNAUTHORIZED)
