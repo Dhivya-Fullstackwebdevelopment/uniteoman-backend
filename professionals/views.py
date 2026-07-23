@@ -918,7 +918,6 @@ def vendor_booking_list(request):
     """
     Vendor-specific booking list with status, category, and date filtering.
     """
-    # Assuming user is linked to a Professional profile
     try:
         professional = Professional.objects.get(user=request.user)
     except Professional.DoesNotExist:
@@ -926,19 +925,53 @@ def vendor_booking_list(request):
 
     queryset = Booking.objects.filter(professional=professional)
 
-    # 1. Status Filter (Today, Upcoming, Completed, Cancelled)
     status_filter = request.GET.get('status', '').lower()
     today = timezone.localdate()
 
+    # Statuses considered "active" (job not yet completed/cancelled)
+    ACTIVE_STATUSES = [
+        Booking.STATUS_SCHEDULED,
+        Booking.STATUS_PENDING,
+        Booking.STATUS_CONFIRMED,
+        Booking.STATUS_EN_ROUTE,
+        Booking.STATUS_ARRIVED,
+        Booking.STATUS_IN_PROGRESS,
+    ]
+
+    # Statuses that mean the pro is literally on the job right now
+    ONGOING_STATUSES = [
+        Booking.STATUS_EN_ROUTE,
+        Booking.STATUS_ARRIVED,
+        Booking.STATUS_IN_PROGRESS,
+    ]
+
+    # 1. Status Filtering
     if status_filter == 'today':
-        queryset = queryset.filter(booking_date=today)
+        queryset = queryset.filter(
+            booking_date=today
+        ).exclude(
+            status__in=[Booking.STATUS_CANCELLED, Booking.STATUS_COMPLETED]
+        )
+
+    elif status_filter == 'ongoing':
+        # Jobs currently in progress, regardless of date
+        queryset = queryset.filter(status__in=ONGOING_STATUSES)
+
     elif status_filter == 'upcoming':
-        queryset = queryset.filter(booking_date__gt=today, status__in=[Booking.STATUS_SCHEDULED, Booking.STATUS_PENDING, Booking.STATUS_CONFIRMED])
+        # FIX: use __gte so TODAY'S not-yet-started bookings are included,
+        # not just strictly-future dates. Ongoing jobs are included too
+        # regardless of date (e.g. a job that started yesterday and is
+        # still IN_PROGRESS should still show as "upcoming/active").
+        queryset = queryset.filter(
+            Q(booking_date__gte=today, status__in=ACTIVE_STATUSES) |
+            Q(status__in=ONGOING_STATUSES)
+        )
+
     elif status_filter == 'completed':
         queryset = queryset.filter(status=Booking.STATUS_COMPLETED)
+
     elif status_filter == 'cancelled':
         queryset = queryset.filter(status=Booking.STATUS_CANCELLED)
-
     # 2. Category / Service Filter
     category_id = request.GET.get('category_id')
     if category_id:
@@ -951,13 +984,27 @@ def vendor_booking_list(request):
 
     queryset = queryset.order_by('-booking_date', '-booking_time')
 
+    # Pagination — default 10 per page
+    page_number = request.GET.get('page', 1)
+    page_size = request.GET.get('page_size', 10)
+    paginator = Paginator(queryset, page_size)
+    page_obj = paginator.get_page(page_number)
+
+    def build_page_url(page_num):
+        if not page_num:
+            return None
+        params = request.GET.copy()
+        params['page'] = page_num
+        params['page_size'] = page_size
+        return f"{request.path}?{params.urlencode()}"
+
     data = []
-    for booking in queryset:
+    for booking in page_obj:
         booking_datetime = timezone.datetime.combine(booking.booking_date, booking.booking_time)
         data.append({
             "id": booking.id,
             "booking_code": booking.booking_code,
-            "service_name": booking.service_type.service.name if booking.service_type else "",
+            "service_name": booking.service_type.service.name if booking.service_type and booking.service_type.service else "",
             "service_type": booking.service_type.type_name if booking.service_type else "",
             "customer_name": booking.user_name,
             "date_time": booking_datetime.strftime('%a %d %b %I:%M %p'),
@@ -970,6 +1017,12 @@ def vendor_booking_list(request):
     return Response({
         "status": "success",
         "count": len(data),
+        "total_count": paginator.count,
+        "total_pages": paginator.num_pages,
+        "current_page": page_obj.number,
+        "page_size": int(page_size),
+        "next": build_page_url(page_obj.next_page_number()) if page_obj.has_next() else None,
+        "previous": build_page_url(page_obj.previous_page_number()) if page_obj.has_previous() else None,
         "data": data
     })
 

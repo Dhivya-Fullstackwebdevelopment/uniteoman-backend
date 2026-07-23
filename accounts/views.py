@@ -427,6 +427,7 @@ def vendor_login(request):
     return Response({
         'status': 'success',
         'message': 'Vendor login successful',
+        'professional_id': professional.id,  
         'user': {
             'id': professional.id,
             'email': professional.email,
