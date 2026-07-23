@@ -2,6 +2,7 @@ from django.urls import path
 from . import views
 from .views import (
     vendor_booking_list,
+    vendor_my_services,
     admin_all_bookings,
     admin_booking_control_assign,
 )
@@ -30,8 +31,10 @@ urlpatterns = [
     path("bookings/<int:pk>/reschedule/", views.reschedule_booking, name="reschedule_booking_api"),
     path("bookings/<int:pk>/book-again/", views.booking_book_again, name="booking_book_again"),
 
+    path("<int:pk>/services/", views.professional_services_by_id, name="professional_services_by_id"),
     # Vendor API
     path("vendor/bookings/", vendor_booking_list, name="vendor_booking_list"),
+    path("vendor/services/", vendor_my_services, name="vendor_my_services"),
 
     # Admin APIs
     path("admin/bookings/", admin_all_bookings, name="admin_all_bookings"),

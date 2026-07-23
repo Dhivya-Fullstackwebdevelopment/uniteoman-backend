@@ -1191,3 +1191,127 @@ def admin_booking_control_assign(request, booking_id=None):
         "unassigned_queue": queue_data,
         "ai_smart_routing": smart_routing_data
     })
+
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_my_services(request):
+    """
+    Returns the list of services / service-types the LOGGED-IN professional
+    (identified via JWT token, not a query param) currently offers,
+    grouped by parent Service category, with each offering's own price.
+
+    Optional: ?category_id=<Service id> to filter to one category.
+    """
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({
+            "status": "error",
+            "message": "Professional profile not found for this account."
+        }, status=404)
+
+    offerings = ProfessionalServiceType.objects.filter(
+        professional=professional
+    ).select_related('service_type', 'service_type__service')
+
+    category_id = request.GET.get('category_id')
+    if category_id:
+        offerings = offerings.filter(service_type__service_id=category_id)
+
+    # Group offerings by parent Service (category)
+    grouped = {}
+    for o in offerings:
+        st = o.service_type
+        service = st.service
+        if service is None:
+            continue
+        key = service.id
+        if key not in grouped:
+            grouped[key] = {
+                "service_id": service.id,
+                "service_name": service.name,
+                "icon": request.build_absolute_uri(service.icon.url) if service.icon and hasattr(service.icon, 'url') else "",
+                "service_types": []
+            }
+        grouped[key]["service_types"].append({
+            "service_type_id": st.id,
+            "type_name": st.type_name,
+            "duration": st.duration,
+            "price": str(o.price),          # vendor's own price for this type
+            "default_price": str(st.price), # platform default, for comparison
+            "is_active": o.is_active,
+        })
+
+    data = list(grouped.values())
+    total_service_types = sum(len(g["service_types"]) for g in data)
+
+    return Response({
+        "status": "success",
+        "message": "Services offered by this professional fetched successfully.",
+        "professional_id": professional.id,
+        "professional_name": professional.name,
+        "categories_count": len(data),
+        "service_types_count": total_service_types,
+        "data": data
+    })
+
+
+def professional_services_by_id(request, pk):
+    """
+    PUBLIC endpoint — list the services/service-types a specific
+    professional (given by professional_id in the URL) offers.
+    No login required — used for customer-facing profile pages.
+
+    Optional: ?category_id=<Service id> to filter to one category.
+    """
+    try:
+        professional = Professional.objects.get(pk=pk, is_active=True)
+    except Professional.DoesNotExist:
+        return JsonResponse({
+            "status": "error",
+            "message": "Professional not found."
+        }, status=404)
+
+    offerings = ProfessionalServiceType.objects.filter(
+        professional=professional,
+        is_active=True
+    ).select_related('service_type', 'service_type__service')
+
+    category_id = request.GET.get('category_id')
+    if category_id:
+        offerings = offerings.filter(service_type__service_id=category_id)
+
+    grouped = {}
+    for o in offerings:
+        st = o.service_type
+        service = st.service
+        if service is None:
+            continue
+        key = service.id
+        if key not in grouped:
+            grouped[key] = {
+                "service_id": service.id,
+                "service_name": service.name,
+                "icon": request.build_absolute_uri(service.icon.url) if service.icon and hasattr(service.icon, 'url') else "",
+                "service_types": []
+            }
+        grouped[key]["service_types"].append({
+            "service_type_id": st.id,
+            "type_name": st.type_name,
+            "duration": st.duration,
+            "price": str(o.price),
+        })
+
+    data = list(grouped.values())
+    total_service_types = sum(len(g["service_types"]) for g in data)
+
+    return JsonResponse({
+        "status": "success",
+        "message": "Services offered by this professional fetched successfully.",
+        "professional_id": professional.id,
+        "professional_name": professional.name,
+        "categories_count": len(data),
+        "service_types_count": total_service_types,
+        "data": data
+    })
