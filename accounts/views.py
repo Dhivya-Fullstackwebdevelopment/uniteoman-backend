@@ -316,20 +316,24 @@ def admin_login(request):
     
     # Generate JWT tokens (using admin's email as identifier)
     from rest_framework_simplejwt.tokens import RefreshToken
-    
-    # Create a dummy user object for JWT (or use actual User if exists)
+
+    # Reuse an existing User row, or create+save a real one.
+    # NOTE: must always be .save()'d, otherwise user.id is None and
+    # RefreshToken.for_user(user) bakes user_id="None" into the JWT,
+    # which breaks every authenticated endpoint later.
     try:
         user = User.objects.get(email=email)
     except User.DoesNotExist:
-        # Create a temporary user for JWT
-        user = User(
+        user = User.objects.create(
             email=admin.email,
+            mobile_number=admin.mobile_number or f"admin-{admin.id}",
             name=admin.name,
-            mobile_number=admin.mobile_number,
             is_staff=admin.is_staff,
-            is_superuser=admin.is_superuser
+            is_superuser=admin.is_superuser,
         )
-    
+        user.set_unusable_password()
+        user.save()
+
     refresh = RefreshToken.for_user(user)
     
     return Response({
@@ -396,18 +400,28 @@ def vendor_login(request):
     
     # Generate JWT tokens
     from rest_framework_simplejwt.tokens import RefreshToken
-    
-    # Create a dummy user object for JWT
+
+    # Reuse an existing User row, or create+save a real one.
+    # NOTE: must always be .save()'d, otherwise user.id is None and
+    # RefreshToken.for_user(user) bakes user_id="None" into the JWT,
+    # which breaks every authenticated endpoint later.
     try:
         user = User.objects.get(email=email)
     except User.DoesNotExist:
-        # Create a temporary user for JWT
-        user = User(
+        user = User.objects.create(
             email=professional.email,
+            mobile_number=professional.phone or f"vendor-{professional.id}",
             name=professional.name,
-            mobile_number=professional.phone
         )
-    
+        user.set_unusable_password()
+        user.save()
+
+    # Link the Professional record to this User so vendor_booking_list
+    # (which does Professional.objects.get(user=request.user)) can find it.
+    if professional.user_id != user.id:
+        professional.user = user
+        professional.save(update_fields=["user"])
+
     refresh = RefreshToken.for_user(user)
     
     return Response({
