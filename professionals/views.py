@@ -1079,11 +1079,19 @@ def admin_all_bookings(request):
 
         return response
 
-    # Pagination
+   # Pagination
     page_number = request.GET.get('page', 1)
-    page_size = request.GET.get('page_size', 20)
+    page_size = request.GET.get('page_size', 10)
     paginator = Paginator(queryset, page_size)
     page_obj = paginator.get_page(page_number)
+
+    def build_page_url(page_num):
+        if not page_num:
+            return None
+        params = request.GET.copy()
+        params['page'] = page_num
+        params['page_size'] = page_size
+        return f"{request.path}?{params.urlencode()}"
 
     data = []
     for b in page_obj:
@@ -1103,9 +1111,13 @@ def admin_all_bookings(request):
 
     return Response({
         "status": "success",
+        "count": len(data),
         "total_count": paginator.count,
         "total_pages": paginator.num_pages,
         "current_page": page_obj.number,
+        "page_size": int(page_size),
+        "next": build_page_url(page_obj.next_page_number()) if page_obj.has_next() else None,
+        "previous": build_page_url(page_obj.previous_page_number()) if page_obj.has_previous() else None,
         "data": data
     })
 
