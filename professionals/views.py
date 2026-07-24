@@ -774,6 +774,14 @@ def booking_cancel(request, pk):
             "message": "Booking already cancelled.",
         }, status=400)
 
+    # Only allow cancellation WITHIN the first 15 minutes of booking creation
+    minutes_since_created = (timezone.now() - booking.created_at).total_seconds() / 60
+    if minutes_since_created > 15:
+        return JsonResponse({
+            "status": "error",
+            "message": "Cancellation window has expired. You can only cancel within 15 minutes of booking.",
+        }, status=400)
+
     booking.status = Booking.STATUS_CANCELLED
     booking.save(update_fields=["status", "updated_at"])
 
@@ -782,7 +790,6 @@ def booking_cancel(request, pk):
         "message": "Booking cancelled.",
         "data": serialize_booking(booking, request),
     })
-
 
 # ---------------------------------------------------------------------------
 # POST /api/bookings/<id>/reschedule/
