@@ -214,3 +214,28 @@ class Booking(models.Model):
         self.vat_amount = vat_amount
         self.total_amount = total
         return total
+
+class ProfessionalServiceArea(models.Model):
+    """Per-area price override for a professional's service offering."""
+    offering = models.ForeignKey(
+        ProfessionalServiceType, on_delete=models.CASCADE, related_name="area_prices"
+    )
+    area = models.CharField(max_length=100)
+    price = models.DecimalField(max_digits=10, decimal_places=2)
+
+    class Meta:
+        unique_together = ("offering", "area")
+
+    def __str__(self):
+        return f"{self.offering} @ {self.area} = {self.price}"
+
+
+class ProfessionalArea(models.Model):
+    """Service areas a professional operates in (the pill list at the bottom)."""
+    professional = models.ForeignKey(
+        Professional, on_delete=models.CASCADE, related_name="service_areas"
+    )
+    area = models.CharField(max_length=100)
+
+    class Meta:
+        unique_together = ("professional", "area")

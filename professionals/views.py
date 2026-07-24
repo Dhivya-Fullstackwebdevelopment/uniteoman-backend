@@ -23,6 +23,15 @@ from django.db.models import Q
 from django.utils import timezone
 from .models import Booking, Professional
 from django.core.paginator import Paginator
+from statistics import mean
+from .models import (
+    Professional,
+    ProfessionalServiceType,
+    Review,
+    Booking,
+    ProfessionalServiceArea,
+    ProfessionalArea,
+)
 
 User = get_user_model()
 
@@ -1384,4 +1393,354 @@ def booking_available_professionals(request, booking_id):
         "current_professional_id": booking.professional_id,
         "available_count": len(pros_list),
         "data": pros_list,
+    })
+
+
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_services_pricing(request):
+    """
+    'My Services & Pricing' table: base price + per-area price for each
+    offering the logged-in vendor has, grouped/filterable by category.
+    """
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    offerings = ProfessionalServiceType.objects.filter(
+        professional=professional
+    ).select_related("service_type", "service_type__service").prefetch_related("area_prices")
+
+    category_id = request.GET.get("category_id")
+    if category_id:
+        offerings = offerings.filter(service_type__service_id=category_id)
+
+    my_areas = list(
+        ProfessionalArea.objects.filter(professional=professional).values_list("area", flat=True)
+    )
+
+    data = []
+    for o in offerings:
+        area_price_map = {ap.area: str(ap.price) for ap in o.area_prices.all()}
+        area_prices = {area: area_price_map.get(area, str(o.price)) for area in my_areas}
+
+        data.append({
+            "offering_id": o.id,
+            "service_type_id": o.service_type.id,
+            "service_name": o.service_type.type_name,
+            "category_id": o.service_type.service_id,
+            "category_name": o.service_type.service.name if o.service_type.service else None,
+            "base_price": str(o.price),
+            "area_prices": area_prices,
+            "status": "active" if o.is_active else "paused",
+        })
+
+    return Response({
+        "status": "success",
+        "professional_id": professional.id,
+        "service_areas": my_areas,
+        "count": len(data),
+        "data": data,
+    })
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/professionals/vendor/services/<offering_id>/price/
+# Body: { "base_price": 15.00, "area_prices": {"MSQ Hills": 18.00} }
+# ---------------------------------------------------------------------------
+
+@api_view(['PATCH'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_update_service_price(request, offering_id):
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    offering = get_object_or_404(
+        ProfessionalServiceType, id=offering_id, professional=professional
+    )
+
+    base_price = request.data.get("base_price")
+    area_prices = request.data.get("area_prices", {})
+
+    floor = offering.service_type.price_floor
+    cap = offering.service_type.price_cap
+
+    def validate(p):
+        p = Decimal(str(p))
+        if floor is not None and p < floor:
+            raise ValueError(f"Price cannot be below the admin floor of OMR {floor}.")
+        if cap is not None and p > cap:
+            raise ValueError(f"Price cannot exceed the admin cap of OMR {cap}.")
+        return p
+
+    from decimal import Decimal
+    try:
+        if base_price is not None:
+            offering.price = validate(base_price)
+            offering.save(update_fields=["price"])
+
+        for area, price in area_prices.items():
+            validated = validate(price)
+            ProfessionalServiceArea.objects.update_or_create(
+                offering=offering, area=area, defaults={"price": validated}
+            )
+    except ValueError as e:
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+    return Response({
+        "status": "success",
+        "message": "Pricing updated.",
+        "offering_id": offering.id,
+        "base_price": str(offering.price),
+        "area_prices": {ap.area: str(ap.price) for ap in offering.area_prices.all()},
+    })
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/professionals/vendor/services/<offering_id>/status/
+# Body: { "is_active": true }
+# ---------------------------------------------------------------------------
+
+@api_view(['PATCH'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_toggle_service_status(request, offering_id):
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    offering = get_object_or_404(
+        ProfessionalServiceType, id=offering_id, professional=professional
+    )
+
+    is_active = request.data.get("is_active")
+    if is_active is None:
+        return Response({"status": "error", "message": "is_active is required."}, status=400)
+
+    offering.is_active = bool(is_active)
+    offering.save(update_fields=["is_active"])
+
+    return Response({
+        "status": "success",
+        "message": f"{offering.service_type.type_name} is now {'active' if offering.is_active else 'paused'}.",
+        "offering_id": offering.id,
+        "status_value": "active" if offering.is_active else "paused",
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /api/professionals/vendor/services/add/
+# Body: { "service_type_id": 5, "base_price": 20.00 }
+# ---------------------------------------------------------------------------
+
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_add_service(request):
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    service_type_id = request.data.get("service_type_id")
+    base_price = request.data.get("base_price")
+
+    if not service_type_id or base_price is None:
+        return Response({
+            "status": "error",
+            "message": "service_type_id and base_price are required."
+        }, status=400)
+
+    service_type = get_object_or_404(ServiceType, id=service_type_id, is_active=True)
+
+    if ProfessionalServiceType.objects.filter(
+        professional=professional, service_type=service_type
+    ).exists():
+        return Response({
+            "status": "error",
+            "message": "You already offer this service."
+        }, status=409)
+
+    offering = ProfessionalServiceType.objects.create(
+        professional=professional,
+        service_type=service_type,
+        price=base_price,
+        is_active=True,
+    )
+
+    return Response({
+        "status": "success",
+        "message": f"{service_type.type_name} added to your services.",
+        "offering_id": offering.id,
+    }, status=201)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/professionals/vendor/services/ai-pricing/
+# ---------------------------------------------------------------------------
+
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_ai_pricing_suggestions(request):
+    """
+    Compares this vendor's price per service+area against the market
+    average (all OTHER active vendors' price for that service_type+area)
+    and flags where they're under/over market.
+    """
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    my_offerings = ProfessionalServiceType.objects.filter(
+        professional=professional, is_active=True
+    ).select_related("service_type").prefetch_related("area_prices")
+
+    suggestions = []
+
+    for o in my_offerings:
+        my_areas = ProfessionalArea.objects.filter(professional=professional).values_list("area", flat=True)
+        area_price_map = {ap.area: ap.price for ap in o.area_prices.all()}
+
+        for area in my_areas:
+            my_price = area_price_map.get(area, o.price)
+
+            # Market prices: other vendors' price for same service_type in same area
+            market_qs = ProfessionalServiceArea.objects.filter(
+                offering__service_type=o.service_type,
+                area=area,
+            ).exclude(offering__professional=professional).values_list("price", flat=True)
+
+            market_prices = list(market_qs)
+            if not market_prices:
+                # fallback to base prices of other vendors offering this service_type
+                market_prices = list(
+                    ProfessionalServiceType.objects.filter(
+                        service_type=o.service_type, is_active=True
+                    ).exclude(professional=professional).values_list("price", flat=True)
+                )
+
+            if not market_prices:
+                continue
+
+            market_avg = round(mean([float(p) for p in market_prices]), 2)
+            diff = round(market_avg - float(my_price), 2)
+
+            if abs(diff) < 1:
+                continue  # close enough to market, no suggestion needed
+
+            if diff > 0:
+                message = (
+                    f"Your {o.service_type.type_name} OMR {my_price} is market-rate. "
+                    f"{area} avg is OMR {market_avg} — you could charge more there."
+                )
+                direction = "increase"
+            else:
+                message = (
+                    f"Your {o.service_type.type_name} OMR {my_price} is above the "
+                    f"{area} avg of OMR {market_avg} — consider lowering to stay competitive."
+                )
+                direction = "decrease"
+
+            suggestions.append({
+                "offering_id": o.id,
+                "service_type_id": o.service_type.id,
+                "service_name": o.service_type.type_name,
+                "area": area,
+                "your_price": str(my_price),
+                "market_avg": str(market_avg),
+                "direction": direction,
+                "message": message,
+            })
+
+    return Response({
+        "status": "success",
+        "count": len(suggestions),
+        "data": suggestions,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Service Areas: GET list / POST add / DELETE remove
+# ---------------------------------------------------------------------------
+
+@api_view(['GET', 'POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_service_areas(request):
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    if request.method == 'GET':
+        areas = list(
+            ProfessionalArea.objects.filter(professional=professional).values_list("area", flat=True)
+        )
+        return Response({"status": "success", "data": areas})
+
+    # POST — add a new area
+    area = request.data.get("area", "").strip()
+    if not area:
+        return Response({"status": "error", "message": "area is required."}, status=400)
+
+    obj, created = ProfessionalArea.objects.get_or_create(professional=professional, area=area)
+    if not created:
+        return Response({"status": "error", "message": "Area already added."}, status=409)
+
+    return Response({"status": "success", "message": f"{area} added.", "data": area}, status=201)
+
+
+@api_view(['DELETE'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_remove_service_area(request, area_name):
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    deleted, _ = ProfessionalArea.objects.filter(professional=professional, area=area_name).delete()
+    if not deleted:
+        return Response({"status": "error", "message": "Area not found."}, status=404)
+
+    return Response({"status": "success", "message": f"{area_name} removed."})
+
+
+def professional_working_areas(request, pk):
+    """
+    PUBLIC endpoint — returns the list of working/service areas for a
+    SPECIFIC professional (by professional_id in the URL).
+    No login required — used on customer-facing profile pages.
+    """
+    try:
+        professional = Professional.objects.get(pk=pk, is_active=True)
+    except Professional.DoesNotExist:
+        return JsonResponse({
+            "status": "error",
+            "message": "Professional not found."
+        }, status=404)
+
+    areas = list(
+        ProfessionalArea.objects.filter(professional=professional)
+        .order_by("area")
+        .values_list("area", flat=True)
+    )
+
+    return JsonResponse({
+        "status": "success",
+        "message": "Working areas fetched successfully.",
+        "professional_id": professional.id,
+        "professional_name": professional.name,
+        "primary_area": professional.area,          # their main/HQ area
+        "governorate": professional.governorate.name if professional.governorate else None,
+        "count": len(areas),
+        "data": areas,
     })
