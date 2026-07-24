@@ -32,6 +32,7 @@ urlpatterns = [
     path("bookings/<int:pk>/book-again/", views.booking_book_again, name="booking_book_again"),
 
     path("<int:pk>/services/", views.professional_services_by_id, name="professional_services_by_id"),
+    path("bookings/<int:booking_id>/available-professionals/", views.booking_available_professionals, name="booking_available_professionals"),
     # Vendor API
     path("vendor/bookings/", vendor_booking_list, name="vendor_booking_list"),
     path("vendor/services/", vendor_my_services, name="vendor_my_services"),

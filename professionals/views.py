@@ -1334,3 +1334,54 @@ def professional_services_by_id(request, pk):
         "service_types_count": total_service_types,
         "data": data
     })
+
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def booking_available_professionals(request, booking_id):
+    """
+    Returns the list of professionals available to be assigned to a
+    SPECIFIC booking, based on that booking's service_type.
+    Used to populate the 'Assign Professional' dropdown when the admin
+    clicks Assign/Reassign on a particular booking row.
+    """
+    booking = get_object_or_404(Booking, id=booking_id)
+
+    available_pros = Professional.objects.filter(
+        offerings__service_type=booking.service_type,
+        offerings__is_active=True,
+        is_active=True
+    ).distinct().select_related("governorate")
+
+    pros_list = []
+    for p in available_pros:
+        offering = p.offerings.filter(
+            service_type=booking.service_type, is_active=True
+        ).first()
+        pros_list.append({
+            "id": p.id,
+            "name": p.name,
+            "specialty": p.specialty,
+            "rating": float(p.rating),
+            "jobs_done": p.jobs_done,
+            "distance_km": float(p.distance_km),
+            "area": p.area,
+            "governorate": p.governorate.name if p.governorate else None,
+            "is_available_today": p.is_available_today,
+            "price": str(offering.price) if offering else None,
+            "ai_score": p.ai_match_score(booking.service_type),
+            "is_current": booking.professional_id == p.id,
+        })
+
+    # Sort best match first
+    pros_list.sort(key=lambda x: x["ai_score"], reverse=True)
+
+    return Response({
+        "status": "success",
+        "booking_id": booking.id,
+        "booking_code": booking.booking_code,
+        "service_type": booking.service_type.type_name if booking.service_type else None,
+        "current_professional_id": booking.professional_id,
+        "available_count": len(pros_list),
+        "data": pros_list,
+    })
