@@ -1226,13 +1226,6 @@ def admin_booking_control_assign(request, booking_id=None):
 @authentication_classes([JWTAuthentication])
 @permission_classes([IsAuthenticated])
 def vendor_my_services(request):
-    """
-    Returns the list of services / service-types the LOGGED-IN professional
-    (identified via JWT token, not a query param) currently offers,
-    grouped by parent Service category, with each offering's own price.
-
-    Optional: ?category_id=<Service id> to filter to one category.
-    """
     try:
         professional = Professional.objects.get(user=request.user)
     except Professional.DoesNotExist:
@@ -1249,7 +1242,7 @@ def vendor_my_services(request):
     if category_id:
         offerings = offerings.filter(service_type__service_id=category_id)
 
-    # Group offerings by parent Service (category)
+    # ---- EXISTING GROUPING LOGIC (unchanged) ----
     grouped = {}
     for o in offerings:
         st = o.service_type
@@ -1268,13 +1261,16 @@ def vendor_my_services(request):
             "service_type_id": st.id,
             "type_name": st.type_name,
             "duration": st.duration,
-            "price": str(o.price),          # vendor's own price for this type
-            "default_price": str(st.price), # platform default, for comparison
+            "price": str(o.price),
+            "default_price": str(st.price),
             "is_active": o.is_active,
         })
 
     data = list(grouped.values())
     total_service_types = sum(len(g["service_types"]) for g in data)
+
+    # ---- NEW: build the AI pricing banner dynamically ----
+    ai_note = _build_ai_pricing_note(professional)
 
     return Response({
         "status": "success",
@@ -1283,8 +1279,93 @@ def vendor_my_services(request):
         "professional_name": professional.name,
         "categories_count": len(data),
         "service_types_count": total_service_types,
-        "data": data
+        "data": data,
+        "ai_pricing_note": ai_note,   # <-- new field only, nothing else changed
     })
+
+
+def _build_ai_pricing_note(professional):
+    """
+    Computes a single dynamic AI banner message, same comparison logic
+    as vendor_ai_pricing_suggestions, but only returns the SINGLE
+    most relevant suggestion (biggest opportunity) as text.
+    """
+    my_offerings = ProfessionalServiceType.objects.filter(
+        professional=professional, is_active=True
+    ).select_related("service_type").prefetch_related("area_prices")
+
+    my_areas = list(
+        ProfessionalArea.objects.filter(professional=professional).values_list("area", flat=True)
+    )
+
+    candidates = []
+
+    for o in my_offerings:
+        area_price_map = {ap.area: ap.price for ap in o.area_prices.all()}
+
+        for area in my_areas:
+            my_price = area_price_map.get(area, o.price)
+
+            market_qs = ProfessionalServiceArea.objects.filter(
+                offering__service_type=o.service_type,
+                area=area,
+            ).exclude(offering__professional=professional).values_list("price", flat=True)
+
+            market_prices = list(market_qs)
+            if not market_prices:
+                market_prices = list(
+                    ProfessionalServiceType.objects.filter(
+                        service_type=o.service_type, is_active=True
+                    ).exclude(professional=professional).values_list("price", flat=True)
+                )
+
+            if not market_prices:
+                continue
+
+            market_avg = round(mean([float(p) for p in market_prices]), 2)
+            diff = round(market_avg - float(my_price), 2)
+
+            if abs(diff) < 1:
+                continue
+
+            direction = "increase" if diff > 0 else "decrease"
+
+            if direction == "increase":
+                message = (
+                    f"Your {o.service_type.type_name} OMR {my_price} is market-rate. "
+                    f"{area} avg is OMR {market_avg} — you could charge more there."
+                )
+            else:
+                message = (
+                    f"Your {o.service_type.type_name} OMR {my_price} is above the "
+                    f"{area} avg of OMR {market_avg} — consider lowering to stay competitive."
+                )
+
+            candidates.append({
+                "service_type_id": o.service_type.id,
+                "service_name": o.service_type.type_name,
+                "area": area,
+                "your_price": str(my_price),
+                "market_avg": str(market_avg),
+                "direction": direction,
+                "gap": abs(diff),
+                "message": message,
+            })
+
+    if not candidates:
+        return None
+
+    # pick the biggest price gap = most "worth showing" suggestion
+    best = max(candidates, key=lambda c: c["gap"])
+    return {
+        "service_type_id": best["service_type_id"],
+        "service_name": best["service_name"],
+        "area": best["area"],
+        "your_price": best["your_price"],
+        "market_avg": best["market_avg"],
+        "direction": best["direction"],
+        "message": best["message"],
+    }
 
 
 def professional_services_by_id(request, pk):
