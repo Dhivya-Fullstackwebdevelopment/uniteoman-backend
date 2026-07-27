@@ -1483,10 +1483,6 @@ def booking_available_professionals(request, booking_id):
 @authentication_classes([JWTAuthentication])
 @permission_classes([IsAuthenticated])
 def vendor_services_pricing(request):
-    """
-    'My Services & Pricing' table: base price + per-area price for each
-    offering the logged-in vendor has, grouped/filterable by category.
-    """
     try:
         professional = Professional.objects.get(user=request.user)
     except Professional.DoesNotExist:
@@ -1500,16 +1496,19 @@ def vendor_services_pricing(request):
     if category_id:
         offerings = offerings.filter(service_type__service_id=category_id)
 
+    offerings = offerings.order_by("service_type__service_id", "service_type__type_name")
+
     my_areas = list(
         ProfessionalArea.objects.filter(professional=professional).values_list("area", flat=True)
     )
 
-    data = []
+    # ---- Build flat list (one row per service_type) — this is what service_types_count counts ----
+    all_rows = []
     for o in offerings:
         area_price_map = {ap.area: str(ap.price) for ap in o.area_prices.all()}
         area_prices = {area: area_price_map.get(area, str(o.price)) for area in my_areas}
 
-        data.append({
+        all_rows.append({
             "offering_id": o.id,
             "service_type_id": o.service_type.id,
             "service_name": o.service_type.type_name,
@@ -1520,14 +1519,151 @@ def vendor_services_pricing(request):
             "status": "active" if o.is_active else "paused",
         })
 
+    total_service_types = len(all_rows)
+
+    # ---- Category filter chips (All + per-category counts), for the tab bar ----
+    category_chip_qs = ProfessionalServiceType.objects.filter(
+        professional=professional
+    ).select_related("service_type__service")
+
+    chip_counts = {}
+    for o in category_chip_qs:
+        if not o.service_type.service:
+            continue
+        cid = o.service_type.service_id
+        cname = o.service_type.service.name
+        if cid not in chip_counts:
+            chip_counts[cid] = {"category_id": cid, "category_name": cname, "count": 0}
+        chip_counts[cid]["count"] += 1
+
+    category_filters = [{"category_id": None, "category_name": "All", "count": category_chip_qs.count()}]
+    category_filters += sorted(chip_counts.values(), key=lambda c: c["category_name"])
+
+    # ---- Pagination on the flat service_type rows ----
+    page_number = request.GET.get("page", 1)
+    page_size = request.GET.get("page_size", 10)
+    paginator = Paginator(all_rows, page_size)
+    page_obj = paginator.get_page(page_number)
+
+    def build_page_url(page_num):
+        if not page_num:
+            return None
+        params = request.GET.copy()
+        params["page"] = page_num
+        params["page_size"] = page_size
+        return f"{request.path}?{params.urlencode()}"
+
+    # ---- AI suggestions, scoped to the SAME category filter, as a cyclable list ----
+    ai_suggestions = _build_ai_pricing_suggestions(professional, category_id)
+    ai_index = int(request.GET.get("ai_index", 0))
+    ai_note = None
+    if ai_suggestions:
+        ai_index = max(0, min(ai_index, len(ai_suggestions) - 1))
+        ai_note = {
+            **ai_suggestions[ai_index],
+            "position": ai_index + 1,          # 1-based, e.g. "2" in "2/6"
+            "total": len(ai_suggestions),        # e.g. "6" in "2/6"
+            "has_next": ai_index + 1 < len(ai_suggestions),
+            "has_previous": ai_index > 0,
+        }
+
     return Response({
         "status": "success",
         "professional_id": professional.id,
         "service_areas": my_areas,
-        "count": len(data),
-        "data": data,
+        "category_filters": category_filters,
+        "categories_count": len({r["category_id"] for r in all_rows}),
+        "service_types_count": total_service_types,
+        "count": len(page_obj.object_list),
+        "total_count": paginator.count,
+        "total_pages": paginator.num_pages,
+        "current_page": page_obj.number,
+        "page_size": int(page_size),
+        "next": build_page_url(page_obj.next_page_number()) if page_obj.has_next() else None,
+        "previous": build_page_url(page_obj.previous_page_number()) if page_obj.has_previous() else None,
+        "data": list(page_obj.object_list),
+        "ai_pricing_note": ai_note,
     })
 
+
+def _build_ai_pricing_suggestions(professional, category_id=None):
+    """
+    Returns ALL price-gap suggestions (not just one), optionally scoped
+    to a single category, sorted by biggest gap first — so ai_index=0
+    is the most important suggestion, matching the "Next ->" cycling UI.
+    """
+    my_offerings = ProfessionalServiceType.objects.filter(
+        professional=professional, is_active=True
+    ).select_related("service_type", "service_type__service").prefetch_related("area_prices")
+
+    if category_id:
+        my_offerings = my_offerings.filter(service_type__service_id=category_id)
+
+    my_areas = list(
+        ProfessionalArea.objects.filter(professional=professional).values_list("area", flat=True)
+    )
+
+    suggestions = []
+
+    for o in my_offerings:
+        area_price_map = {ap.area: ap.price for ap in o.area_prices.all()}
+
+        for area in my_areas:
+            my_price = area_price_map.get(area, o.price)
+
+            market_qs = ProfessionalServiceArea.objects.filter(
+                offering__service_type=o.service_type,
+                area=area,
+            ).exclude(offering__professional=professional).values_list("price", flat=True)
+
+            market_prices = list(market_qs)
+            if not market_prices:
+                market_prices = list(
+                    ProfessionalServiceType.objects.filter(
+                        service_type=o.service_type, is_active=True
+                    ).exclude(professional=professional).values_list("price", flat=True)
+                )
+
+            if not market_prices:
+                continue
+
+            market_avg = round(mean([float(p) for p in market_prices]), 2)
+            diff = round(market_avg - float(my_price), 2)
+
+            if abs(diff) < 1:
+                continue
+
+            direction = "increase" if diff > 0 else "decrease"
+
+            if direction == "increase":
+                message = (
+                    f"Your {o.service_type.type_name} OMR {my_price} is market-rate. "
+                    f"{area} avg is OMR {market_avg} — you could charge more there."
+                )
+            else:
+                message = (
+                    f"Your {o.service_type.type_name} OMR {my_price} is above the "
+                    f"{area} avg of OMR {market_avg} — consider lowering to stay competitive."
+                )
+
+            suggestions.append({
+                "service_type_id": o.service_type.id,
+                "service_name": o.service_type.type_name,
+                "category_id": o.service_type.service_id,
+                "area": area,
+                "your_price": str(my_price),
+                "market_avg": str(market_avg),
+                "direction": direction,
+                "gap": abs(diff),
+                "message": message,
+            })
+
+    # biggest gap first — so cycling "Next" moves from most to least urgent
+    suggestions.sort(key=lambda s: s["gap"], reverse=True)
+    for s in suggestions:
+        s.pop("gap", None)  # internal sort key, not needed in response
+
+    return suggestions
 
 # ---------------------------------------------------------------------------
 # PATCH /api/professionals/vendor/services/<offering_id>/price/
