@@ -1599,11 +1599,20 @@ def _validate_decimal(value, field_name):
 @permission_classes([IsAuthenticated])
 def vendor_service_categories(request):
     """
-    Returns all active categories (services_service) with their
-    active service names (services_servicetype), for the
-    CATEGORY / SERVICE NAME dropdowns in 'Add New Service'.
+    Returns categories + service names available in the vendor's
+    OWN governorate (working location) only — not all 231 duplicated
+    rows across every governorate in the system.
     """
-    categories = Service.objects.filter(is_active=True).order_by("name")
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    # Only categories tied to this vendor's governorate
+    categories = Service.objects.filter(
+        is_active=True,
+        governorate=professional.governorate
+    ).order_by("name")
 
     data = []
     for c in categories:
@@ -1619,10 +1628,11 @@ def vendor_service_categories(request):
 
     return Response({
         "status": "success",
+        "governorate_id": professional.governorate_id,
+        "governorate": professional.governorate.name if professional.governorate else None,
         "count": len(data),
         "data": data,
     })
-
 
 # ---------------------------------------------------------------------------
 # POST /api/professionals/vendor/services/add/
