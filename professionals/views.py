@@ -1681,22 +1681,54 @@ def vendor_service_areas(request):
         return Response({"status": "error", "message": "Professional profile not found."}, status=404)
 
     if request.method == 'GET':
-        areas = list(
-            ProfessionalArea.objects.filter(professional=professional).values_list("area", flat=True)
+        my_areas = list(
+            ProfessionalArea.objects.filter(professional=professional)
+            .order_by("area")
+            .values_list("area", flat=True)
         )
-        return Response({"status": "success", "data": areas})
 
-    # POST — add a new area
+        # Areas available to pick from, based on the vendor's own governorate
+        available_areas = sorted(set(
+            Professional.objects.filter(
+                governorate=professional.governorate, is_active=True
+            ).exclude(area="").values_list("area", flat=True)
+        ))
+
+        # Areas not yet added by this vendor
+        not_added = [a for a in available_areas if a not in my_areas]
+
+        return Response({
+            "status": "success",
+            "governorate_id": professional.governorate_id,
+            "governorate": professional.governorate.name if professional.governorate else None,
+            "my_areas": my_areas,
+            "available_areas": available_areas,
+            "not_added_areas": not_added,
+        })
+
+    # POST — add a new area (must be one of the available areas for their governorate)
     area = request.data.get("area", "").strip()
     if not area:
         return Response({"status": "error", "message": "area is required."}, status=400)
+
+    valid_areas = set(
+        Professional.objects.filter(
+            governorate=professional.governorate, is_active=True
+        ).exclude(area="").values_list("area", flat=True)
+    )
+
+    if area not in valid_areas:
+        return Response({
+            "status": "error",
+            "message": f"'{area}' is not a recognized area in {professional.governorate.name if professional.governorate else 'your region'}.",
+            "valid_areas": sorted(valid_areas),
+        }, status=400)
 
     obj, created = ProfessionalArea.objects.get_or_create(professional=professional, area=area)
     if not created:
         return Response({"status": "error", "message": "Area already added."}, status=409)
 
     return Response({"status": "success", "message": f"{area} added.", "data": area}, status=201)
-
 
 @api_view(['DELETE'])
 @authentication_classes([JWTAuthentication])
