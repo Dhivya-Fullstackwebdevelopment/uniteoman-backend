@@ -32,6 +32,8 @@ from .models import (
     ProfessionalServiceArea,
     ProfessionalArea,
 )
+from decimal import Decimal, InvalidOperation
+from services.models import Service, ServiceType
 
 User = get_user_model()
 
@@ -1539,46 +1541,270 @@ def vendor_toggle_service_status(request, offering_id):
 # Body: { "service_type_id": 5, "base_price": 20.00 }
 # ---------------------------------------------------------------------------
 
-@api_view(['POST'])
+# @api_view(['POST'])
+# @authentication_classes([JWTAuthentication])
+# @permission_classes([IsAuthenticated])
+# def vendor_add_service(request):
+#     try:
+#         professional = Professional.objects.get(user=request.user)
+#     except Professional.DoesNotExist:
+#         return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+#     service_type_id = request.data.get("service_type_id")
+#     base_price = request.data.get("base_price")
+
+#     if not service_type_id or base_price is None:
+#         return Response({
+#             "status": "error",
+#             "message": "service_type_id and base_price are required."
+#         }, status=400)
+
+#     service_type = get_object_or_404(ServiceType, id=service_type_id, is_active=True)
+
+#     if ProfessionalServiceType.objects.filter(
+#         professional=professional, service_type=service_type
+#     ).exists():
+#         return Response({
+#             "status": "error",
+#             "message": "You already offer this service."
+#         }, status=409)
+
+#     offering = ProfessionalServiceType.objects.create(
+#         professional=professional,
+#         service_type=service_type,
+#         price=base_price,
+#         is_active=True,
+#     )
+
+#     return Response({
+#         "status": "success",
+#         "message": f"{service_type.type_name} added to your services.",
+#         "offering_id": offering.id,
+#     }, status=201)
+
+def _validate_decimal(value, field_name):
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError(f"{field_name} must be a valid number.")
+
+
+# ---------------------------------------------------------------------------
+# GET  /api/professionals/vendor/services/categories/
+# Returns categories + their service names, for populating the two dropdowns
+# ---------------------------------------------------------------------------
+
+@api_view(['GET'])
 @authentication_classes([JWTAuthentication])
 @permission_classes([IsAuthenticated])
-def vendor_add_service(request):
+def vendor_service_categories(request):
+    """
+    Returns all active categories (services_service) with their
+    active service names (services_servicetype), for the
+    CATEGORY / SERVICE NAME dropdowns in 'Add New Service'.
+    """
+    categories = Service.objects.filter(is_active=True).order_by("name")
+
+    data = []
+    for c in categories:
+        types = ServiceType.objects.filter(service=c, is_active=True).order_by("type_name")
+        data.append({
+            "category_id": c.id,
+            "category_name": c.name,
+            "service_names": [
+                {"id": t.id, "type_name": t.type_name, "price": str(t.price)}
+                for t in types
+            ]
+        })
+
+    return Response({
+        "status": "success",
+        "count": len(data),
+        "data": data,
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /api/professionals/vendor/services/add/
+# PUT/PATCH /api/professionals/vendor/services/<offering_id>/edit/
+#
+# Body:
+# {
+#   "category_id": 3,                 // OR
+#   "new_category_name": "AC & HVAC", // if creating a new category
+#
+#   "service_type_id": 12,            // OR
+#   "new_service_name": "AC Cleaning",// if creating a new service name
+#
+#   "base_price": 20,
+#   "status": "active" | "paused",
+#   "area_prices": {"Qurum": 15, "Al Khuwair": 15, "MSQ Hills": 18}
+# }
+# ---------------------------------------------------------------------------
+
+@api_view(['POST', 'PUT', 'PATCH'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+@transaction.atomic
+def vendor_add_or_edit_service(request, offering_id=None):
     try:
         professional = Professional.objects.get(user=request.user)
     except Professional.DoesNotExist:
         return Response({"status": "error", "message": "Professional profile not found."}, status=404)
 
-    service_type_id = request.data.get("service_type_id")
-    base_price = request.data.get("base_price")
+    payload = request.data
+    is_edit = offering_id is not None
 
-    if not service_type_id or base_price is None:
+    # -----------------------------------------------------------------
+    # 1. Resolve / create CATEGORY (services_service)
+    # -----------------------------------------------------------------
+    category_id = payload.get("category_id")
+    new_category_name = (payload.get("new_category_name") or "").strip()
+
+    if new_category_name:
+        # "+ Add New Category" was used -> create it if it doesn't exist
+        category, _ = Service.objects.get_or_create(
+            name__iexact=new_category_name,
+            defaults={
+                "name": new_category_name,
+                "governorate": professional.governorate,
+                "starting_price": payload.get("base_price") or 0,
+                "is_active": True,
+                # icon is required (non-null ImageField) — must be uploaded
+                # separately via multipart/form-data 'icon' if you enforce it,
+                # or make Service.icon blank=True/null=True to relax this.
+            }
+        )
+    elif category_id:
+        try:
+            category = Service.objects.get(id=category_id, is_active=True)
+        except Service.DoesNotExist:
+            return Response({"status": "error", "message": "Category not found."}, status=404)
+    elif is_edit:
+        # editing: category not changing, pull from existing offering
+        existing = get_object_or_404(ProfessionalServiceType, id=offering_id, professional=professional)
+        category = existing.service_type.service
+    else:
         return Response({
             "status": "error",
-            "message": "service_type_id and base_price are required."
+            "message": "Provide category_id or new_category_name."
         }, status=400)
 
-    service_type = get_object_or_404(ServiceType, id=service_type_id, is_active=True)
+    # -----------------------------------------------------------------
+    # 2. Resolve / create SERVICE NAME (services_servicetype)
+    # -----------------------------------------------------------------
+    service_type_id = payload.get("service_type_id")
+    new_service_name = (payload.get("new_service_name") or "").strip()
+    base_price = payload.get("base_price")
 
-    if ProfessionalServiceType.objects.filter(
-        professional=professional, service_type=service_type
-    ).exists():
+    if base_price is None:
+        return Response({"status": "error", "message": "base_price is required."}, status=400)
+
+    try:
+        base_price = _validate_decimal(base_price, "base_price")
+    except ValueError as e:
+        return Response({"status": "error", "message": str(e)}, status=400)
+
+    if new_service_name:
+        # "+ Add New Service Name" was used -> create it under the category
+        service_type, created = ServiceType.objects.get_or_create(
+            service=category,
+            type_name__iexact=new_service_name,
+            defaults={
+                "type_name": new_service_name,
+                "price": base_price,
+                "duration": payload.get("duration", ""),
+                "description": payload.get("description", ""),
+                "is_active": True,
+            }
+        )
+    elif service_type_id:
+        try:
+            service_type = ServiceType.objects.get(id=service_type_id, service=category, is_active=True)
+        except ServiceType.DoesNotExist:
+            return Response({
+                "status": "error",
+                "message": "Service name not found under selected category."
+            }, status=404)
+    elif is_edit:
+        existing = get_object_or_404(ProfessionalServiceType, id=offering_id, professional=professional)
+        service_type = existing.service_type
+    else:
         return Response({
             "status": "error",
-            "message": "You already offer this service."
-        }, status=409)
+            "message": "Provide service_type_id or new_service_name."
+        }, status=400)
 
-    offering = ProfessionalServiceType.objects.create(
-        professional=professional,
-        service_type=service_type,
-        price=base_price,
-        is_active=True,
-    )
+    # -----------------------------------------------------------------
+    # 3. Status
+    # -----------------------------------------------------------------
+    status_value = (payload.get("status") or "active").lower()
+    is_active = status_value != "paused"
+
+    # -----------------------------------------------------------------
+    # 4. Create or update the VENDOR'S offering (ProfessionalServiceType)
+    # -----------------------------------------------------------------
+    if is_edit:
+        offering = get_object_or_404(ProfessionalServiceType, id=offering_id, professional=professional)
+        offering.service_type = service_type
+        offering.price = base_price
+        offering.is_active = is_active
+        offering.save(update_fields=["service_type", "price", "is_active"])
+        created = False
+    else:
+        if ProfessionalServiceType.objects.filter(
+            professional=professional, service_type=service_type
+        ).exists():
+            return Response({
+                "status": "error",
+                "message": "You already offer this service. Use edit instead."
+            }, status=409)
+
+        offering = ProfessionalServiceType.objects.create(
+            professional=professional,
+            service_type=service_type,
+            price=base_price,
+            is_active=is_active,
+        )
+        created = True
+
+    # -----------------------------------------------------------------
+    # 5. Area-specific pricing (Qurum / Al Khuwair / MSQ Hills, etc.)
+    # -----------------------------------------------------------------
+    area_prices_in = payload.get("area_prices", {}) or {}
+    saved_area_prices = {}
+
+    for area_name, price_val in area_prices_in.items():
+        if price_val in (None, ""):
+            continue
+        try:
+            validated_price = _validate_decimal(price_val, f"area_prices[{area_name}]")
+        except ValueError as e:
+            return Response({"status": "error", "message": str(e)}, status=400)
+
+        # make sure this area is registered for the vendor (auto-add if missing)
+        ProfessionalArea.objects.get_or_create(professional=professional, area=area_name)
+
+        ProfessionalServiceArea.objects.update_or_create(
+            offering=offering, area=area_name, defaults={"price": validated_price}
+        )
+        saved_area_prices[area_name] = str(validated_price)
 
     return Response({
         "status": "success",
-        "message": f"{service_type.type_name} added to your services.",
-        "offering_id": offering.id,
-    }, status=201)
+        "message": f"{service_type.type_name} {'updated' if is_edit else 'added'} successfully.",
+        "created": created,
+        "data": {
+            "offering_id": offering.id,
+            "category_id": category.id,
+            "category_name": category.name,
+            "service_type_id": service_type.id,
+            "service_name": service_type.type_name,
+            "base_price": str(offering.price),
+            "status": "active" if offering.is_active else "paused",
+            "area_prices": saved_area_prices,
+        }
+    }, status=201 if not is_edit else 200)
 
 
 # ---------------------------------------------------------------------------

@@ -8,11 +8,13 @@ from .views import (
     vendor_services_pricing,
     vendor_update_service_price,
     vendor_toggle_service_status,
-    vendor_add_service,
+    # vendor_add_service,
     vendor_ai_pricing_suggestions,
     vendor_service_areas,
     vendor_remove_service_area,
-    professional_working_areas
+    professional_working_areas,
+    vendor_service_categories,
+    vendor_add_or_edit_service
 )
 
 urlpatterns = [
@@ -45,13 +47,16 @@ urlpatterns = [
     path("vendor/bookings/", vendor_booking_list, name="vendor_booking_list"),
     path("vendor/services/", vendor_my_services, name="vendor_my_services"),
     path("vendor/services-pricing/", vendor_services_pricing, name="vendor_services_pricing"),
-    path("vendor/services/add/", vendor_add_service, name="vendor_add_service"),
+    # path("vendor/services/add/", vendor_add_service, name="vendor_add_service"),
     path("vendor/services/<int:offering_id>/price/", vendor_update_service_price, name="vendor_update_price"),
     path("vendor/services/<int:offering_id>/status/", vendor_toggle_service_status, name="vendor_toggle_status"),
     path("vendor/services/ai-pricing/", vendor_ai_pricing_suggestions, name="vendor_ai_pricing"),
     path("vendor/areas/", vendor_service_areas, name="vendor_service_areas"),
     path("vendor/areas/<str:area_name>/", vendor_remove_service_area, name="vendor_remove_area"),
     path("<int:pk>/working-areas/", professional_working_areas, name="professional_working_areas"),
+    path("vendor/services/categories/", vendor_service_categories, name="vendor_service_categories"),
+    path("vendor/services/add/", vendor_add_or_edit_service, name="vendor_add_service"),
+    path("vendor/services/<int:offering_id>/edit/", vendor_add_or_edit_service, name="vendor_edit_service"),
 
 
     # Admin APIs
