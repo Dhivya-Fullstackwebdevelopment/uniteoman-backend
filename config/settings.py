@@ -105,6 +105,10 @@ CORS_ALLOWED_ORIGINS = [
     "http://192.168.80.1:5173",
     "http://localhost:5174",
     "http://localhost:5175",
+    "https://uniteoman-user-new2-1xnoa0xo6.vercel.app",
+    "https://uniteoman-user-new2-39gv-22c85s03l.vercel.app",
+    "https://uniteoman-vendor-portal-khm6-gxg6o3c89.vercel.app",
+    "https://unite-oman-admin-itsk6ims5.vercel.app"
 ]
 
 CORS_ALLOW_CREDENTIALS = True
