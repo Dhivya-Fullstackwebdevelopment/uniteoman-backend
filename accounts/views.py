@@ -64,6 +64,8 @@ def send_otp(request):
     
     # For testing - print OTP to console
     print(f"📱 OTP for {mobile_number}: {otp_code}")
+        # display_number = mobile_number if mobile_number.startswith("+") else f"+{mobile_number}"
+        # print(f"📱 OTP for {display_number}: {otp_code}")
     
     return Response({
         'message': 'OTP sent successfully',
@@ -71,6 +73,13 @@ def send_otp(request):
         # Remove this in production, keep for testing
         'debug_otp': otp_code  
     }, status=status.HTTP_200_OK)
+    # display_number = mobile_number if mobile_number.startswith("+") else f"+{mobile_number}"
+
+    # return Response({
+    #      "message": "OTP sent successfully",
+    #      "mobile_number": display_number,
+    #      "debug_otp": otp_code
+    # }, status=status.HTTP_200_OK)
 
 
 @api_view(['POST'])

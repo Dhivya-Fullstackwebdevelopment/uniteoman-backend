@@ -12,6 +12,14 @@ class OTPSendSerializer(serializers.Serializer):
             raise serializers.ValidationError("Invalid mobile number format")
         return value
 
+    # def validate_mobile_number(self, value):
+    # # Allow optional + followed by 8-15 digits
+    #    if not re.match(r'^\+?[0-9]{8,15}$', value):
+    #     raise serializers.ValidationError("Invalid mobile number format")
+
+    # # Remove + before saving (optional)
+    #    return value.lstrip('+')
+
 class OTPVerifySerializer(serializers.Serializer):
     mobile_number = serializers.CharField(max_length=15)
     otp_code = serializers.CharField(max_length=6)
