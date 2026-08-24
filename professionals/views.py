@@ -2,14 +2,14 @@ from datetime import datetime, timedelta, date as date_cls
 import json
 import random
 import string
-from django.db.models import Q
+from django.db.models import Q, Avg, Count
 from django.http import JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from services.models import Service, ServiceType
 from .models import Professional, ProfessionalServiceType, Review, Booking
 from rest_framework.decorators import api_view, authentication_classes, permission_classes
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from django.shortcuts import get_object_or_404 
@@ -34,6 +34,9 @@ from .models import (
 )
 from decimal import Decimal, InvalidOperation
 from services.models import Service, ServiceType
+from .models import Professional, Booking, Review, ReviewPhoto
+from django.shortcuts import get_object_or_404
+
 
 User = get_user_model()
 
@@ -2229,3 +2232,400 @@ def professional_working_areas(request, pk):
         "count": len(areas),
         "data": areas,
     })
+
+
+    
+def _ai_flag(rating: int, comment: str, reviewer_booking_count: int) -> str:
+    """
+    Very simple heuristic AI flag — swap for a real model call if needed.
+    Returns: 'likely_fake' | 'abuse_competitor' | 'genuine'
+    """
+    lower = (comment or '').lower()
+ 
+    # Abuse / competitor mentions
+    abuse_words = ['competitor', 'use [competitor]', 'worst', 'scam', 'fake', 'fraud']
+    if any(w in lower for w in abuse_words):
+        return 'abuse_competitor'
+ 
+    # Likely fake: 5-star generic praise from brand-new account with 0 bookings
+    generic_phrases = ['perfect', 'amazing in every way', 'best ever', 'absolutely']
+    if rating == 5 and reviewer_booking_count == 0 and any(p in lower for p in generic_phrases):
+        return 'likely_fake'
+ 
+    return 'genuine'
+ 
+ 
+def _serialize_review(review, request=None):
+    photos = []
+    for p in review.photos.all():
+        url = request.build_absolute_uri(p.image.url) if request and p.image else ''
+        photos.append({'id': p.id, 'url': url})
+ 
+    return {
+        'id': review.id,
+        'booking_id': review.booking_id,
+        'professional_id': review.professional_id,
+        'reviewer_name': review.reviewer_name,
+        'rating': review.rating,
+        'comment': review.comment,
+        'tags': review.tags or [],
+        'photos': photos,
+        'status': review.status,
+        'ai_flag': review.ai_flag,
+        'vendor_reply': review.vendor_reply,
+        'vendor_replied_at': (
+            review.vendor_replied_at.isoformat() if review.vendor_replied_at else None
+        ),
+        'created_at': review.created_at.strftime('%d %b %Y'),
+    }
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# USER: Submit review for a completed booking
+# POST /api/professionals/bookings/<booking_id>/review/
+# Body (multipart/form-data):
+#   rating        int          1-5  (required)
+#   comment       str          optional
+#   tags          JSON array   e.g. ["Punctual","Professional"]
+#   photos        file(s)      optional, up to 3
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def submit_review(request, booking_id):
+    """Customer submits a review for their completed booking."""
+    booking = get_object_or_404(Booking, id=booking_id, user_email=request.user.email)
+ 
+    # Only allow review after service is completed (or pending/confirmed for demo flexibility)
+    # Tighten to STATUS_COMPLETED only in production:
+    # if booking.status != Booking.STATUS_COMPLETED:
+    #     return Response({'status': 'error', 'message': 'Can only review completed bookings.'}, status=400)
+ 
+    # Prevent duplicate reviews
+    if hasattr(booking, 'review'):
+        return Response({
+            'status': 'error',
+            'message': 'You have already submitted a review for this booking.'
+        }, status=409)
+ 
+    # Validate rating
+    try:
+        rating = int(request.data.get('rating', 5))
+        if not (1 <= rating <= 5):
+            raise ValueError
+    except (ValueError, TypeError):
+        return Response({'status': 'error', 'message': 'Rating must be an integer between 1 and 5.'}, status=400)
+ 
+    comment = (request.data.get('comment') or '').strip()
+ 
+    # Tags: accept JSON string or list
+    raw_tags = request.data.get('tags', [])
+    if isinstance(raw_tags, str):
+        import json
+        try:
+            raw_tags = json.loads(raw_tags)
+        except Exception:
+            raw_tags = []
+    tags = [str(t) for t in raw_tags if t]
+ 
+    # How many bookings has this reviewer made? (used for AI flag)
+    reviewer_booking_count = Booking.objects.filter(user_email=request.user.email).count()
+ 
+    # AI moderation flag
+    ai_flag = _ai_flag(rating, comment, reviewer_booking_count)
+ 
+    # Auto-publish genuine reviews; hold fake/abusive ones for admin review
+    status = Review.STATUS_PUBLISHED if ai_flag == 'genuine' else Review.STATUS_PENDING
+ 
+    review = Review.objects.create(
+        booking=booking,
+        professional=booking.professional,
+        reviewer_name=booking.user_name,
+        rating=rating,
+        comment=comment,
+        tags=tags,
+        ai_flag=ai_flag,
+        status=status,
+    )
+ 
+    # Handle photo uploads (up to 3)
+    photos = request.FILES.getlist('photos')[:3]
+    for photo in photos:
+        ReviewPhoto.objects.create(review=review, image=photo)
+ 
+    # Recalculate professional average rating from published reviews only
+    if booking.professional:
+        _update_professional_rating(booking.professional)
+
+    if not booking.professional:
+        return Response({
+        'status': 'error',
+        'message': 'Cannot review a booking without an assigned professional.'
+    }, status=400)
+ 
+    return Response({
+        'status': 'success',
+        'message': (
+            'Review submitted and published.'
+            if status == Review.STATUS_PUBLISHED
+            else 'Review submitted and is pending admin approval.'
+        ),
+        'data': _serialize_review(review, request),
+    }, status=201)
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# VENDOR: Reply to a review
+# PATCH /api/professionals/reviews/<review_id>/reply/
+# Body: { "vendor_reply": "Thank you so much! Looking forward to serving you again." }
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+@api_view(['PATCH'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_reply_review(request, review_id):
+    """Vendor replies to a published review on their profile."""
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({'status': 'error', 'message': 'Professional profile not found.'}, status=404)
+ 
+    review = get_object_or_404(Review, id=review_id, professional=professional)
+ 
+    if review.status != Review.STATUS_PUBLISHED:
+        return Response({
+            'status': 'error',
+            'message': 'Can only reply to published reviews.'
+        }, status=400)
+ 
+    reply_text = (request.data.get('vendor_reply') or '').strip()
+    if not reply_text:
+        return Response({'status': 'error', 'message': 'vendor_reply is required.'}, status=400)
+ 
+    review.vendor_reply = reply_text
+    review.vendor_replied_at = timezone.now()
+    review.save(update_fields=['vendor_reply', 'vendor_replied_at'])
+ 
+    return Response({
+        'status': 'success',
+        'message': 'Reply posted successfully.',
+        'data': _serialize_review(review, request),
+    })
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# VENDOR: My reviews list (Image 2)
+# GET /api/professionals/vendor/reviews/
+# Query params: ?status=published|pending|all  &service=<name>  &rating=<1-5>
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_reviews(request):
+    """Returns all reviews for the logged-in vendor with rating breakdown."""
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({'status': 'error', 'message': 'Professional profile not found.'}, status=404)
+ 
+    qs = Review.objects.filter(professional=professional).prefetch_related('photos')
+ 
+    # Filter by status (default: show published + pending for vendor)
+    status_filter = request.GET.get('status', 'all').lower()
+    if status_filter == 'published':
+        qs = qs.filter(status=Review.STATUS_PUBLISHED)
+    elif status_filter == 'pending':
+        qs = qs.filter(status=Review.STATUS_PENDING)
+    elif status_filter != 'all':
+        qs = qs.filter(status=Review.STATUS_PUBLISHED)
+ 
+    # Filter by service name
+    service_name = request.GET.get('service', '').strip()
+    if service_name:
+        qs = qs.filter(booking__service_type__type_name__icontains=service_name)
+ 
+    # Filter by rating
+    rating_filter = request.GET.get('rating', '').strip()
+    if rating_filter.isdigit():
+        qs = qs.filter(rating=int(rating_filter))
+ 
+    # Rating breakdown (published reviews only)
+    published_qs = Review.objects.filter(
+        professional=professional, status=Review.STATUS_PUBLISHED
+    )
+    total_published = published_qs.count()
+    avg_rating = published_qs.aggregate(avg=Avg('rating'))['avg'] or 0.0
+ 
+    breakdown = {str(i): 0 for i in range(1, 6)}
+    for row in published_qs.values('rating').annotate(cnt=Count('id')):
+        breakdown[str(row['rating'])] = row['cnt']
+ 
+    breakdown_pct = {
+        k: round((v / total_published * 100)) if total_published else 0
+        for k, v in breakdown.items()
+    }
+ 
+    reviews_data = [_serialize_review(r, request) for r in qs]
+ 
+    return Response({
+        'status': 'success',
+        'professional_id': professional.id,
+        'total_reviews': total_published,
+        'avg_rating': round(avg_rating, 1),
+        'rating_breakdown': breakdown,
+        'rating_breakdown_pct': breakdown_pct,
+        'count': len(reviews_data),
+        'data': reviews_data,
+    })
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN: Moderation queue (Image 3)
+# GET /api/professionals/admin/reviews/moderation/
+# Query params: ?status=pending|published|removed|all  &ai_flag=likely_fake|abuse_competitor|genuine
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_review_moderation(request):
+    """Admin sees all reviews with AI flags, can filter by status / flag type."""
+    qs = Review.objects.all().prefetch_related('photos').select_related('professional', 'booking')
+ 
+    status_filter = request.GET.get('status', 'pending').lower()
+    if status_filter != 'all':
+        qs = qs.filter(status=status_filter)
+ 
+    ai_flag_filter = request.GET.get('ai_flag', '').strip()
+    if ai_flag_filter:
+        qs = qs.filter(ai_flag=ai_flag_filter)
+ 
+    total = Review.objects.count()
+    pending_count = Review.objects.filter(status=Review.STATUS_PENDING).count()
+ 
+    # Counts per ai_flag among pending
+    flag_counts = {}
+    for row in Review.objects.filter(status=Review.STATUS_PENDING).values('ai_flag').annotate(cnt=Count('id')):
+        flag_counts[row['ai_flag'] or 'unknown'] = row['cnt']
+ 
+    data = []
+    for r in qs:
+        booking_count = (
+            Booking.objects.filter(user_email=r.booking.user_email).count()
+            if r.booking else 0
+        )
+        entry = _serialize_review(r, request)
+        entry['professional_name'] = r.professional.name if r.professional else None
+        entry['reviewer_booking_count'] = booking_count
+        entry['is_new_account'] = booking_count == 0
+        data.append(entry)
+ 
+    return Response({
+        'status': 'success',
+        'total_reviews': total,
+        'pending_moderation': pending_count,
+        'flag_counts': flag_counts,
+        'count': len(data),
+        'data': data,
+    })
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN: Approve / Remove a review
+# PATCH /api/professionals/admin/reviews/<review_id>/moderate/
+# Body: { "action": "publish" | "remove", "admin_note": "optional reason" }
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+@api_view(['PATCH'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_moderate_review(request, review_id):
+    """Admin publishes or removes a flagged review."""
+    review = get_object_or_404(Review, id=review_id)
+ 
+    action = (request.data.get('action') or '').lower()
+    if action not in ('publish', 'remove'):
+        return Response({
+            'status': 'error',
+            'message': 'action must be "publish" or "remove".'
+        }, status=400)
+ 
+    review.status = (
+        Review.STATUS_PUBLISHED if action == 'publish' else Review.STATUS_REMOVED
+    )
+    review.admin_note = (request.data.get('admin_note') or '').strip() or None
+    review.save(update_fields=['status', 'admin_note'])
+ 
+    # Recalculate professional's rating after any status change
+    if review.professional:
+        _update_professional_rating(review.professional)
+ 
+    return Response({
+        'status': 'success',
+        'message': f'Review {review.status}.',
+        'data': _serialize_review(review, request),
+    })
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC: Get published reviews for a professional
+# GET /api/professionals/<professional_id>/reviews/
+# Used on customer-facing profile page & service listing
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def professional_reviews_public(request, pk):
+    """
+    Returns only PUBLISHED reviews for a professional.
+    Includes vendor reply if present.
+    """
+    professional = get_object_or_404(Professional, pk=pk, is_active=True)
+ 
+    qs = Review.objects.filter(
+        professional=professional,
+        status=Review.STATUS_PUBLISHED
+    ).prefetch_related('photos')
+ 
+    total = qs.count()
+    avg = qs.aggregate(avg=Avg('rating'))['avg'] or 0.0
+ 
+    breakdown = {str(i): 0 for i in range(1, 6)}
+    for row in qs.values('rating').annotate(cnt=Count('id')):
+        breakdown[str(row['rating'])] = row['cnt']
+ 
+    breakdown_pct = {
+        k: round((v / total * 100)) if total else 0
+        for k, v in breakdown.items()
+    }
+ 
+    data = [_serialize_review(r, request) for r in qs]
+ 
+    return Response({
+        'status': 'success',
+        'professional_id': professional.id,
+        'professional_name': professional.name,
+        'total_reviews': total,
+        'avg_rating': round(avg, 1),
+        'rating_breakdown': breakdown,
+        'rating_breakdown_pct': breakdown_pct,
+        'count': len(data),
+        'data': data,
+    })
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal helper
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+def _update_professional_rating(professional: Professional):
+    """Recalculates and saves the professional's rating from published reviews only."""
+    result = Review.objects.filter(
+        professional=professional,
+        status=Review.STATUS_PUBLISHED
+    ).aggregate(avg=Avg('rating'))
+    
+    new_avg = round(result['avg'] or 5.0, 1)
+    Professional.objects.filter(pk=professional.pk).update(rating=new_avg)

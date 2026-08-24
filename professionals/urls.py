@@ -17,6 +17,15 @@ from .views import (
     vendor_add_or_edit_service
 )
 
+from .views import (
+    submit_review,
+    vendor_reply_review,
+    vendor_reviews,
+    admin_review_moderation,
+    admin_moderate_review,
+    professional_reviews_public,
+)
+
 urlpatterns = [
     # Professional List + Filters
     path("", views.professional_list),
@@ -63,4 +72,30 @@ urlpatterns = [
     path("admin/bookings/", admin_all_bookings, name="admin_all_bookings"),
     path("admin/bookings/assign/", admin_booking_control_assign, name="admin_booking_assign"),
     path("admin/bookings/<int:booking_id>/assign/", admin_booking_control_assign, name="admin_booking_assign_detail"),
+
+     # ── NEW review endpoints ─────────────────────────────────────────────────
+ 
+    # USER: submit review (with optional photo upload) for a specific booking
+    # POST  /api/professionals/bookings/<booking_id>/review/
+    path("bookings/<int:booking_id>/review/", submit_review, name="submit_review"),
+ 
+    # VENDOR: reply to a review
+    # PATCH /api/professionals/reviews/<review_id>/reply/
+    path("reviews/<int:review_id>/reply/", vendor_reply_review, name="vendor_reply_review"),
+ 
+    # VENDOR: see all own reviews with rating breakdown
+    # GET   /api/professionals/vendor/reviews/
+    path("vendor/reviews/", vendor_reviews, name="vendor_reviews"),
+ 
+    # ADMIN: moderation queue (AI-flagged reviews)
+    # GET   /api/professionals/admin/reviews/moderation/
+    path("admin/reviews/moderation/", admin_review_moderation, name="admin_review_moderation"),
+ 
+    # ADMIN: approve or remove a specific review
+    # PATCH /api/professionals/admin/reviews/<review_id>/moderate/
+    path("admin/reviews/<int:review_id>/moderate/", admin_moderate_review, name="admin_moderate_review"),
+ 
+    # PUBLIC: customer-facing published reviews for a professional
+    # GET   /api/professionals/<pk>/reviews/
+    path("<int:pk>/reviews/", professional_reviews_public, name="professional_reviews_public"),
 ]

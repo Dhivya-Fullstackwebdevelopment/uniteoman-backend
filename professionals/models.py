@@ -87,17 +87,62 @@ class ProfessionalServiceType(models.Model):
 
 
 class Review(models.Model):
-    professional = models.ForeignKey(Professional, on_delete=models.CASCADE, related_name="reviews")
+    STATUS_PENDING   = 'pending'
+    STATUS_PUBLISHED = 'published'
+    STATUS_REMOVED   = 'removed'
+    STATUS_CHOICES = [
+        (STATUS_PENDING,   'Pending'),
+        (STATUS_PUBLISHED, 'Published'),
+        (STATUS_REMOVED,   'Removed'),
+    ]
+ 
+    # Core fields (existing)
+    professional  = models.ForeignKey(Professional, on_delete=models.CASCADE, related_name='reviews')
     reviewer_name = models.CharField(max_length=150)
-    rating = models.PositiveSmallIntegerField(default=5)
-    comment = models.TextField(blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
+    rating        = models.PositiveSmallIntegerField(default=5)
+    comment       = models.TextField(blank=True)
+    created_at    = models.DateTimeField(auto_now_add=True)
+ 
+    # NEW: link to the specific booking this review is about
+    booking = models.OneToOneField(
+        'Booking',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='review'
+    )
+ 
+    # NEW: quick-tag pills selected by the user (e.g. ["Punctual","Professional"])
+    tags = models.JSONField(default=list, blank=True)
+ 
+    # NEW: moderation
+    status       = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    admin_note   = models.TextField(blank=True, null=True)
+    ai_flag      = models.CharField(
+        max_length=30, blank=True, null=True,
+        help_text='likely_fake | abuse_competitor | genuine'
+    )
+ 
+    # NEW: vendor reply
+    vendor_reply      = models.TextField(blank=True, null=True)
+    vendor_replied_at = models.DateTimeField(null=True, blank=True)
+ 
     class Meta:
-        ordering = ["-created_at"]
-
+        ordering = ['-created_at']
+ 
     def __str__(self):
-        return f"{self.reviewer_name} -> {self.professional.name} ({self.rating}★)"
+        return f'{self.reviewer_name} -> {self.professional.name} ({self.rating}★) [{self.status}]'
+ 
+ 
+# ----- Add this NEW model after Review -----
+ 
+class ReviewPhoto(models.Model):
+    """Photos attached to a review (uploaded by the customer)."""
+    review     = models.ForeignKey(Review, on_delete=models.CASCADE, related_name='photos')
+    image      = models.ImageField(upload_to='review_photos/')
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+ 
+    def __str__(self):
+        return f'Photo for review {self.review_id}'
 
 
 # class Booking(models.Model):
