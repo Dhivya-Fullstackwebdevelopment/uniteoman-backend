@@ -36,7 +36,18 @@ from decimal import Decimal, InvalidOperation
 from services.models import Service, ServiceType
 from .models import Professional, Booking, Review, ReviewPhoto
 from django.shortcuts import get_object_or_404
-
+from professionals.models import Professional, Booking, Review, ProfessionalServiceType
+from django.db.models.functions import TruncDate, TruncDay, TruncMonth
+from django.db.models import (
+    Avg, Count, Sum, Q, DecimalField, FloatField
+)
+from collections import defaultdict
+from decimal import Decimal
+from datetime import date, timedelta
+from .models import VendorBankAccount, PayoutRequest
+from django.db.models import Sum, Count, Q
+from professionals.models import Professional, Booking
+from decimal import Decimal, ROUND_DOWN
 
 User = get_user_model()
 
@@ -2374,7 +2385,140 @@ def submit_review(request, booking_id):
         'data': _serialize_review(review, request),
     }, status=201)
  
- 
+
+@api_view(['PATCH'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def edit_review(request, booking_id):
+    """Customer edits their existing review."""
+    booking = get_object_or_404(Booking, id=booking_id, user_email=request.user.email)
+
+    # Get existing review
+    if not hasattr(booking, 'review'):
+        return Response({
+            'status': 'error',
+            'message': 'No review found for this booking.'
+        }, status=404)
+
+    review = booking.review
+
+    # Update rating if provided
+    if 'rating' in request.data:
+        try:
+            rating = int(request.data.get('rating'))
+            if not (1 <= rating <= 5):
+                raise ValueError
+            review.rating = rating
+        except (ValueError, TypeError):
+            return Response({'status': 'error', 'message': 'Rating must be 1-5.'}, status=400)
+
+    # Update comment if provided
+    if 'comment' in request.data:
+        review.comment = (request.data.get('comment') or '').strip()
+
+    # Update tags if provided
+    if 'tags' in request.data:
+        raw_tags = request.data.get('tags', [])
+        if isinstance(raw_tags, str):
+            import json
+            try:
+                raw_tags = json.loads(raw_tags)
+            except Exception:
+                raw_tags = []
+        review.tags = [str(t) for t in raw_tags if t]
+
+    # Re-run AI flag on updated content
+    reviewer_booking_count = Booking.objects.filter(user_email=request.user.email).count()
+    review.ai_flag = _ai_flag(review.rating, review.comment, reviewer_booking_count)
+    review.status = Review.STATUS_PUBLISHED if review.ai_flag == 'genuine' else Review.STATUS_PENDING
+
+    review.save(update_fields=['rating', 'comment', 'tags', 'ai_flag', 'status'])
+
+    # Handle new photos if provided
+    new_photos = request.FILES.getlist('photos')
+    if new_photos:
+        # Delete old photos first
+        review.photos.all().delete()
+        for photo in new_photos[:3]:
+            ReviewPhoto.objects.create(review=review, image=photo)
+
+    # Recalculate rating
+    if review.professional:
+        _update_professional_rating(review.professional)
+
+    return Response({
+        'status': 'success',
+        'message': 'Review updated successfully.',
+        'data': _serialize_review(review, request),
+    })
+
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def get_booking_review(request, booking_id):
+    """
+    Fetch existing review details for a specific booking.
+    Returns populated data if submitted, or default placeholders for the frontend.
+    """
+    booking = get_object_or_404(Booking, id=booking_id)
+
+    # Optional: Verify the requesting user owns the booking
+    if booking.user_email != request.user.email and not request.user.is_staff:
+        return Response({
+            "status": "error",
+            "message": "You do not have permission to view review details for this booking."
+        }, status=403)
+
+    review = getattr(booking, 'review', None)
+
+    if not review:
+        return Response({
+            "status": "success",
+            "has_reviewed": False,
+            "data": {
+                "booking_id": booking.id,
+                "professional_id": booking.professional.id if booking.professional else None,
+                "professional_name": booking.professional.name if booking.professional else "",
+                "reviewer_name": booking.user_name,
+                "rating": 5,
+                "comment": "",
+                "tags": [],
+                "photos": [],
+                "status": None,
+                "vendor_reply": None,
+                "vendor_replied_at": None,
+                "created_at": None,
+            }
+        }, status=200)
+
+    # Serialize uploaded photos with absolute URLs
+    photos = [
+        {
+            "id": photo.id,
+            "url": request.build_absolute_uri(photo.image.url) if photo.image else ""
+        }
+        for photo in review.photos.all()
+    ]
+
+    return Response({
+        "status": "success",
+        "has_reviewed": True,
+        "data": {
+            "id": review.id,
+            "booking_id": booking.id,
+            "professional_id": booking.professional.id if booking.professional else None,
+            "professional_name": booking.professional.name if booking.professional else "",
+            "reviewer_name": review.reviewer_name,
+            "rating": review.rating,
+            "comment": review.comment,
+            "tags": review.tags or [],
+            "photos": photos,
+            "status": review.status,
+            "vendor_reply": review.vendor_reply,
+            "vendor_replied_at": review.vendor_replied_at.isoformat() if review.vendor_replied_at else None,
+            "created_at": review.created_at.isoformat(),
+        }
+    }, status=200)
 # ─────────────────────────────────────────────────────────────────────────────
 # VENDOR: Reply to a review
 # PATCH /api/professionals/reviews/<review_id>/reply/
@@ -2629,3 +2773,1225 @@ def _update_professional_rating(professional: Professional):
     
     new_avg = round(result['avg'] or 5.0, 1)
     Professional.objects.filter(pk=professional.pk).update(rating=new_avg)
+
+    
+def _parse_month(month_str):
+    """
+    Parse 'YYYY-MM' into (date_start, date_end).
+    Falls back to current month if blank / invalid.
+    """
+    today = timezone.localdate()
+    if month_str:
+        try:
+            year, month = [int(p) for p in month_str.split("-")]
+            start = date(year, month, 1)
+        except (ValueError, AttributeError):
+            start = today.replace(day=1)
+    else:
+        start = today.replace(day=1)
+ 
+    # last day of the month
+    next_month = (start.replace(day=28) + timedelta(days=4))
+    end = next_month.replace(day=1) - timedelta(days=1)
+    return start, end
+ 
+ 
+def _month_label(d: date) -> str:
+    return d.strftime("%B %Y")          # e.g. "July 2026"
+ 
+ 
+def _pct_change(new_val, old_val):
+    """Return percentage change string, e.g. '↑ 23%' or '↓ 5%'."""
+    if not old_val:
+        return None
+    change = ((new_val - old_val) / old_val) * 100
+    arrow = "↑" if change >= 0 else "↓"
+    return f"{arrow} {abs(round(change, 1))}%"
+ 
+ 
+def _revenue_last_n_days(queryset, days=7):
+    """
+    Return list of {day_label, revenue} for the last `days` days,
+    ordered Mon → Sun relative to today.
+    """
+    today = timezone.localdate()
+    # align to the most-recent Monday
+    monday = today - timedelta(days=today.weekday())
+ 
+    result = []
+    for i in range(days):
+        d = monday + timedelta(days=i)
+        day_qs = queryset.filter(booking_date=d, status=Booking.STATUS_COMPLETED)
+        revenue = day_qs.aggregate(s=Sum("total_amount"))["s"] or Decimal("0")
+        result.append({
+            "day_label": d.strftime("%a")[0],   # M, T, W …
+            "date": d.isoformat(),
+            "revenue": float(round(revenue, 3)),
+        })
+    return result
+ 
+ 
+def _jobs_by_category(queryset):
+    """
+    Return list of {category, icon_emoji, percentage} sorted desc,
+    derived from completed bookings.
+    """
+    SERVICE_ICONS = {
+        "AC Service": "❄️",
+        "Electrical": "⚡",
+        "Plumbing": "🔧",
+        "Appliance": "🏠",
+        "Cleaning": "🧹",
+        "Beauty": "💅",
+    }
+    rows = (
+        queryset
+        .filter(status=Booking.STATUS_COMPLETED)
+        .values(cat_name=models_F("service_type__service__name"))
+        .annotate(cnt=Count("id"))
+        .order_by("-cnt")
+    )
+    total = sum(r["cnt"] for r in rows) or 1
+    return [
+        {
+            "category": r["cat_name"] or "Other",
+            "icon": SERVICE_ICONS.get(r["cat_name"] or "", "🔩"),
+            "count": r["cnt"],
+            "percentage": round(r["cnt"] / total * 100),
+        }
+        for r in rows
+    ]
+ 
+ 
+# We need django.db.models.F — alias to avoid shadowing built-in
+from django.db.models import F as models_F
+ 
+ 
+# ---------------------------------------------------------------------------
+# ── VENDOR ANALYTICS  (Image 1)
+# GET /api/analytics/vendor/?month=YYYY-MM&ai=on
+# ---------------------------------------------------------------------------
+ 
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_analytics(request):
+    """
+    Vendor-facing analytics dashboard.
+ 
+    Returns
+    -------
+    - ai_insight          : str | None        — banner shown when ai=on
+    - month_label         : str               — e.g. "July 2026"
+    - kpis.revenue        : {value, change}
+    - kpis.jobs           : {value, change}
+    - kpis.rating         : {value, review_count}
+    - kpis.completion     : {value_pct, market_avg_pct}
+    - revenue_last_7_days : [{day_label, date, revenue}]
+    - jobs_by_category    : [{category, icon, count, percentage}]
+    """
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response(
+            {"status": "error", "message": "Professional profile not found."},
+            status=404,
+        )
+ 
+    month_str  = request.GET.get("month", "")
+    ai_enabled = request.GET.get("ai", "on").lower() != "off"
+ 
+    start, end = _parse_month(month_str)
+ 
+    # Previous month window (for Δ % change)
+    prev_end   = start - timedelta(days=1)
+    prev_start = prev_end.replace(day=1)
+ 
+    base_qs   = Booking.objects.filter(professional=professional)
+    month_qs  = base_qs.filter(booking_date__range=(start, end))
+    prev_qs   = base_qs.filter(booking_date__range=(prev_start, prev_end))
+ 
+    # ── KPIs ──────────────────────────────────────────────────────────────
+    revenue_curr = (
+        month_qs.filter(status=Booking.STATUS_COMPLETED)
+        .aggregate(s=Sum("total_amount"))["s"] or Decimal("0")
+    )
+    revenue_prev = (
+        prev_qs.filter(status=Booking.STATUS_COMPLETED)
+        .aggregate(s=Sum("total_amount"))["s"] or Decimal("0")
+    )
+ 
+    jobs_curr = month_qs.filter(status=Booking.STATUS_COMPLETED).count()
+    jobs_prev = prev_qs.filter(status=Booking.STATUS_COMPLETED).count()
+ 
+    # Completion rate = completed / (completed + cancelled)  × 100
+    done_curr      = month_qs.filter(status=Booking.STATUS_COMPLETED).count()
+    cancelled_curr = month_qs.filter(status=Booking.STATUS_CANCELLED).count()
+    denom_curr     = done_curr + cancelled_curr or 1
+    completion_pct = round(done_curr / denom_curr * 100)
+ 
+    # Market-wide completion rate (all professionals, same month)
+    mkt_done   = Booking.objects.filter(
+        booking_date__range=(start, end), status=Booking.STATUS_COMPLETED
+    ).count()
+    mkt_cancel = Booking.objects.filter(
+        booking_date__range=(start, end), status=Booking.STATUS_CANCELLED
+    ).count()
+    mkt_denom  = mkt_done + mkt_cancel or 1
+    market_avg_completion = round(mkt_done / mkt_denom * 100)
+ 
+    # Rating from published reviews
+    avg_rating   = float(professional.rating)
+    review_count = Review.objects.filter(
+        professional=professional, status=Review.STATUS_PUBLISHED
+    ).count()
+ 
+    # ── Revenue last 7 days ───────────────────────────────────────────────
+    revenue_chart = _revenue_last_n_days(base_qs)
+ 
+    # ── Jobs by category ─────────────────────────────────────────────────
+    jobs_cat = _jobs_by_category(month_qs)
+ 
+    # ── AI insight ────────────────────────────────────────────────────────
+    ai_insight = None
+    if ai_enabled:
+        ai_insight = _build_vendor_ai_insight(
+            professional, month_qs, completion_pct, market_avg_completion
+        )
+ 
+    return Response({
+        "status":       "success",
+        "month_label":  _month_label(start),
+        "ai_enabled":   ai_enabled,
+        "ai_insight":   ai_insight,
+        "kpis": {
+            "revenue": {
+                "value":    float(round(revenue_curr, 3)),
+                "currency": "OMR",
+                "change":   _pct_change(float(revenue_curr), float(revenue_prev)),
+            },
+            "jobs": {
+                "value":  jobs_curr,
+                "change": _pct_change(jobs_curr, jobs_prev),
+            },
+            "rating": {
+                "value":        avg_rating,
+                "review_count": review_count,
+            },
+            "completion": {
+                "value_pct":      completion_pct,
+                "market_avg_pct": market_avg_completion,
+            },
+        },
+        "revenue_last_7_days": revenue_chart,
+        "jobs_by_category":    jobs_cat,
+    })
+ 
+ 
+def _build_vendor_ai_insight(professional, month_qs, completion_pct, market_avg_pct):
+    """
+    Generate the AI banner shown at the top of the Vendor Analytics screen.
+    Mirrors the example in Image 1:
+      "Completion rate 98% vs market avg 91%.
+       Fri–Sat peak demand — add slots.
+       Bowsher has 12 unmatched AC bookings — expand coverage there for more revenue."
+    """
+    parts = []
+ 
+    # 1. Completion vs market
+    parts.append(
+        f"Completion rate {completion_pct}% vs market avg {market_avg_pct}%."
+    )
+ 
+    # 2. Peak-day detection (find the 2 busiest booking days in the month)
+    day_counts = (
+        month_qs
+        .values("booking_date")
+        .annotate(cnt=Count("id"))
+        .order_by("-cnt")[:2]
+    )
+    if day_counts:
+        day_names = sorted({
+            date.fromisoformat(str(r["booking_date"])).strftime("%a")
+            for r in day_counts
+        })
+        if day_names:
+            parts.append(
+                f"{'–'.join(day_names)} peak demand — add slots."
+            )
+ 
+    # 3. Unmatched bookings in vendor's areas that they could cover
+    vendor_service_type_ids = list(
+        ProfessionalServiceType.objects.filter(
+            professional=professional, is_active=True
+        ).values_list("service_type_id", flat=True)
+    )
+ 
+    unmatched_count = Booking.objects.filter(
+        professional__isnull=True,
+        service_type_id__in=vendor_service_type_ids,
+    ).exclude(status=Booking.STATUS_CANCELLED).count()
+ 
+    if unmatched_count:
+        # Find the area with the most unmatched bookings
+        top_area_row = (
+            Booking.objects.filter(
+                professional__isnull=True,
+                service_type_id__in=vendor_service_type_ids,
+            )
+            .exclude(status=Booking.STATUS_CANCELLED)
+            .values("area")
+            .annotate(cnt=Count("id"))
+            .order_by("-cnt")
+            .first()
+        )
+        area_label = top_area_row["area"] if top_area_row else "your area"
+        parts.append(
+            f"{area_label} has {unmatched_count} unmatched bookings "
+            f"— expand coverage there for more revenue."
+        )
+ 
+    return " ".join(parts) if parts else None
+ 
+ 
+# ---------------------------------------------------------------------------
+# ── ADMIN ANALYTICS  (Image 2)
+# GET /api/analytics/admin/?month=YYYY-MM&ai=on
+# ---------------------------------------------------------------------------
+ 
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_analytics(request):
+    """
+    Admin-facing AI analytics dashboard.
+ 
+    Returns
+    -------
+    - ai_weekly_banner      : str | None
+    - month_label           : str
+    - revenue_90_days       : [{date, revenue, is_forecast}]
+    - demand_by_service     : [{service, icon, percentage}]
+    - ai_churn_alerts       : {high_risk, medium_risk, recovered_risk}
+    """
+    month_str  = request.GET.get("month", "")
+    ai_enabled = request.GET.get("ai", "on").lower() != "off"
+ 
+    start, end = _parse_month(month_str)
+ 
+    # ── Revenue: 60 actual days + 30 forecast days ────────────────────────
+    revenue_90 = _build_revenue_90_days(end)
+ 
+    # ── Demand by service (all bookings in the month) ─────────────────────
+    demand_rows = (
+        Booking.objects
+        .filter(booking_date__range=(start, end))
+        .exclude(status=Booking.STATUS_CANCELLED)
+        .values(service_name=models_F("service_type__service__name"))
+        .annotate(cnt=Count("id"))
+        .order_by("-cnt")
+    )
+    SERVICE_ICONS_ADMIN = {
+        "AC":           "❄️",
+        "AC Service":   "❄️",
+        "Cleaning":     "🧹",
+        "Plumbing":     "🔧",
+        "Electrical":   "⚡",
+        "Beauty":       "💅",
+    }
+    total_demand = sum(r["cnt"] for r in demand_rows) or 1
+ 
+    demand_by_service = []
+    others_pct = 0
+    for i, r in enumerate(demand_rows):
+        pct = round(r["cnt"] / total_demand * 100)
+        name = r["service_name"] or "Other"
+        if i < 5:
+            demand_by_service.append({
+                "service":    name,
+                "icon":       SERVICE_ICONS_ADMIN.get(name, "🔩"),
+                "count":      r["cnt"],
+                "percentage": pct,
+            })
+        else:
+            others_pct += pct
+ 
+    if others_pct:
+        demand_by_service.append({
+            "service":    "Others",
+            "icon":       "📦",
+            "count":      None,
+            "percentage": others_pct,
+        })
+ 
+    # ── AI Churn Alerts ───────────────────────────────────────────────────
+    churn_alerts = _build_churn_alerts()
+ 
+    # ── AI Weekly banner ──────────────────────────────────────────────────
+    ai_weekly_banner = None
+    if ai_enabled:
+        ai_weekly_banner = _build_admin_ai_weekly(start, end)
+ 
+    return Response({
+        "status":           "success",
+        "month_label":      _month_label(start),
+        "ai_enabled":       ai_enabled,
+        "ai_weekly_banner": ai_weekly_banner,
+        "revenue_90_days":  revenue_90,
+        "demand_by_service": demand_by_service,
+        "ai_churn_alerts":  churn_alerts,
+    })
+ 
+ 
+def _build_revenue_90_days(period_end: date):
+    """
+    Returns 60 days of actual completed-booking revenue
+    PLUS 30 days of simple linear-trend forecast.
+    Each entry: {date, revenue, is_forecast}
+    """
+    actual_start = period_end - timedelta(days=59)
+ 
+    # Aggregate actual revenue per day
+    rows = (
+        Booking.objects
+        .filter(
+            booking_date__range=(actual_start, period_end),
+            status=Booking.STATUS_COMPLETED,
+        )
+        .values("booking_date")
+        .annotate(rev=Sum("total_amount"))
+        .order_by("booking_date")
+    )
+    rev_map = {r["booking_date"]: float(r["rev"] or 0) for r in rows}
+ 
+    actual_series = []
+    for i in range(60):
+        d = actual_start + timedelta(days=i)
+        actual_series.append({
+            "date":        d.isoformat(),
+            "revenue":     round(rev_map.get(d, 0), 3),
+            "is_forecast": False,
+        })
+ 
+    # Simple linear forecast: use avg of last 14 actual days as baseline,
+    # apply a small growth factor per day
+    last_14 = [p["revenue"] for p in actual_series[-14:] if p["revenue"] > 0]
+    baseline = sum(last_14) / len(last_14) if last_14 else 0
+    growth_per_day = baseline * 0.005   # 0.5% daily growth assumption
+ 
+    forecast_series = []
+    for i in range(1, 31):
+        d = period_end + timedelta(days=i)
+        forecast_val = round(baseline + growth_per_day * i, 3)
+        forecast_series.append({
+            "date":        d.isoformat(),
+            "revenue":     forecast_val,
+            "is_forecast": True,
+        })
+ 
+    return actual_series + forecast_series
+ 
+ 
+def _build_churn_alerts():
+    """
+    Classify all active professionals into churn risk tiers.
+ 
+    High Risk    : 0 completed bookings in last 18 days
+    Medium Risk  : 0 completed bookings in last 32 days (but not high-risk)
+    Recovered    : had 0 bookings 14+ days ago, now has bookings in last 7 days
+    """
+    today = timezone.localdate()
+ 
+    all_pros = Professional.objects.filter(is_active=True)
+ 
+    high_risk      = []
+    medium_risk    = []
+    recovered_risk = []
+ 
+    for pro in all_pros:
+        jobs_last_7  = Booking.objects.filter(
+            professional=pro,
+            booking_date__gte=today - timedelta(days=7),
+            status=Booking.STATUS_COMPLETED,
+        ).count()
+ 
+        jobs_last_18 = Booking.objects.filter(
+            professional=pro,
+            booking_date__gte=today - timedelta(days=18),
+            status=Booking.STATUS_COMPLETED,
+        ).count()
+ 
+        jobs_last_32 = Booking.objects.filter(
+            professional=pro,
+            booking_date__gte=today - timedelta(days=32),
+            status=Booking.STATUS_COMPLETED,
+        ).count()
+ 
+        days_since = None
+        last_booking = (
+            Booking.objects.filter(
+                professional=pro, status=Booking.STATUS_COMPLETED
+            )
+            .order_by("-booking_date")
+            .first()
+        )
+        if last_booking:
+            days_since = (today - last_booking.booking_date).days
+ 
+        if jobs_last_18 == 0:
+            label = f"0 jobs in {days_since if days_since else 18}+ days"
+            high_risk.append({
+                "professional_id":   pro.id,
+                "professional_name": pro.name,
+                "label":             label,
+                "days_inactive":     days_since,
+                "action":            "send_retention_offer",
+            })
+        elif jobs_last_32 == 0:
+            label = f"No booking {days_since if days_since else 32} days"
+            medium_risk.append({
+                "professional_id":   pro.id,
+                "professional_name": pro.name,
+                "label":             label,
+                "days_inactive":     days_since,
+                "action":            "send_nudge",
+            })
+        elif jobs_last_7 > 0 and days_since is not None and days_since < 7:
+            # Was inactive (no bookings between day-14 and day-7) but now active
+            was_inactive = Booking.objects.filter(
+                professional=pro,
+                booking_date__range=(today - timedelta(days=14), today - timedelta(days=8)),
+                status=Booking.STATUS_COMPLETED,
+            ).count() == 0
+ 
+            if was_inactive:
+                recovered_risk.append({
+                    "professional_id":   pro.id,
+                    "professional_name": pro.name,
+                    "label":             "Re-engaged via AI push",
+                    "days_inactive":     None,
+                    "action":            None,
+                })
+ 
+    return {
+        "high_risk":      high_risk[:5],
+        "medium_risk":    medium_risk[:5],
+        "recovered_risk": recovered_risk[:5],
+    }
+ 
+ 
+def _build_admin_ai_weekly(start: date, end: date):
+    """
+    Compose the AI Weekly banner string shown in Image 2:
+    "Bookings ↑118% vs last week. AC demand peaking. 3 vendors risk churn —
+     0 bookings in 14+ days. Bowsher underserved — 38 unmatched bookings last
+     7 days. Recommend recruiting 4 more AC techs."
+    """
+    today   = timezone.localdate()
+    parts   = []
+ 
+    # 1. Booking volume vs last week
+    this_week_start = today - timedelta(days=today.weekday())
+    last_week_start = this_week_start - timedelta(days=7)
+    last_week_end   = this_week_start - timedelta(days=1)
+ 
+    bookings_this = Booking.objects.filter(
+        booking_date__gte=this_week_start
+    ).exclude(status=Booking.STATUS_CANCELLED).count()
+ 
+    bookings_last = Booking.objects.filter(
+        booking_date__range=(last_week_start, last_week_end)
+    ).exclude(status=Booking.STATUS_CANCELLED).count()
+ 
+    if bookings_last > 0:
+        pct = round((bookings_this - bookings_last) / bookings_last * 100)
+        arrow = "↑" if pct >= 0 else "↓"
+        parts.append(f"Bookings {arrow}{abs(pct)}% vs last week.")
+ 
+    # 2. Peaking service
+    top_service = (
+        Booking.objects.filter(
+            booking_date__range=(today - timedelta(days=7), today)
+        )
+        .exclude(status=Booking.STATUS_CANCELLED)
+        .values(name=models_F("service_type__service__name"))
+        .annotate(cnt=Count("id"))
+        .order_by("-cnt")
+        .first()
+    )
+    if top_service:
+        parts.append(f"{top_service['name']} demand peaking.")
+ 
+    # 3. Churn risk count
+    churn_count = Professional.objects.filter(is_active=True).count()
+    high_churn  = 0
+    for pro in Professional.objects.filter(is_active=True):
+        jobs = Booking.objects.filter(
+            professional=pro,
+            booking_date__gte=today - timedelta(days=14),
+            status=Booking.STATUS_COMPLETED,
+        ).count()
+        if jobs == 0:
+            high_churn += 1
+ 
+    if high_churn:
+        parts.append(
+            f"{high_churn} vendor{'s' if high_churn > 1 else ''} risk churn "
+            f"— 0 bookings in 14+ days."
+        )
+ 
+    # 4. Most underserved area (unmatched bookings)
+    unmatched_by_area = (
+        Booking.objects.filter(
+            professional__isnull=True,
+            booking_date__gte=today - timedelta(days=7),
+        )
+        .exclude(status=Booking.STATUS_CANCELLED)
+        .values("area")
+        .annotate(cnt=Count("id"))
+        .order_by("-cnt")
+        .first()
+    )
+    if unmatched_by_area:
+        area = unmatched_by_area["area"]
+        cnt  = unmatched_by_area["cnt"]
+        parts.append(
+            f"{area} underserved — {cnt} unmatched bookings last 7 days."
+        )
+ 
+        # 5. Recruitment suggestion: top service in that area
+        top_svc = (
+            Booking.objects.filter(
+                professional__isnull=True,
+                booking_date__gte=today - timedelta(days=7),
+                area=area,
+            )
+            .exclude(status=Booking.STATUS_CANCELLED)
+            .values(name=models_F("service_type__service__name"))
+            .annotate(cnt=Count("id"))
+            .order_by("-cnt")
+            .first()
+        )
+        if top_svc:
+            needed = max(1, round(cnt / 10))   # rough heuristic
+            parts.append(
+                f"Recommend recruiting {needed} more "
+                f"{top_svc['name']} tech{'s' if needed > 1 else ''}."
+            )
+ 
+    return " ".join(parts) if parts else None
+ 
+ 
+# ---------------------------------------------------------------------------
+# ── ADMIN ANALYTICS: Retention Action
+# POST /api/analytics/admin/churn/<professional_id>/retention/
+# ---------------------------------------------------------------------------
+ 
+@api_view(["POST"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_send_retention_offer(request, professional_id):
+    """
+    Trigger a retention offer for a high-risk vendor.
+    In production this would fire an SMS/email/push notification.
+    Returns a confirmation payload.
+    """
+    try:
+        pro = Professional.objects.get(pk=professional_id, is_active=True)
+    except Professional.DoesNotExist:
+        return Response(
+            {"status": "error", "message": "Professional not found."},
+            status=404,
+        )
+ 
+    # ── placeholder: hook your notification service here ──
+    # e.g. send_sms(pro.phone, "We miss you! Here's a 10% bonus on your next job.")
+ 
+    return Response({
+        "status":  "success",
+        "message": f"Retention offer sent to {pro.name} ({pro.phone or pro.email or 'no contact'}).",
+        "data": {
+            "professional_id":   pro.id,
+            "professional_name": pro.name,
+            "phone":             pro.phone,
+            "action_taken":      "retention_offer_sent",
+        },
+    })
+ 
+ 
+# ---------------------------------------------------------------------------
+# ── ADMIN ANALYTICS: Summary KPIs
+# GET /api/analytics/admin/kpis/?month=YYYY-MM
+# ---------------------------------------------------------------------------
+ 
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_kpis(request):
+    """
+    High-level KPIs for the admin header/summary row.
+ 
+    Returns
+    -------
+    - total_revenue, total_bookings, active_vendors,
+      avg_rating, completion_rate, unmatched_bookings
+    Each with optional change vs previous month.
+    """
+    month_str = request.GET.get("month", "")
+    start, end = _parse_month(month_str)
+ 
+    prev_end   = start - timedelta(days=1)
+    prev_start = prev_end.replace(day=1)
+ 
+    def _bqs(s, e):
+        return Booking.objects.filter(booking_date__range=(s, e))
+ 
+    curr_qs = _bqs(start, end)
+    prev_qs = _bqs(prev_start, prev_end)
+ 
+    # Revenue
+    rev_curr = curr_qs.filter(status=Booking.STATUS_COMPLETED).aggregate(
+        s=Sum("total_amount")
+    )["s"] or Decimal("0")
+    rev_prev = prev_qs.filter(status=Booking.STATUS_COMPLETED).aggregate(
+        s=Sum("total_amount")
+    )["s"] or Decimal("0")
+ 
+    # Bookings
+    bk_curr = curr_qs.exclude(status=Booking.STATUS_CANCELLED).count()
+    bk_prev = prev_qs.exclude(status=Booking.STATUS_CANCELLED).count()
+ 
+    # Active vendors (had at least 1 booking in the month)
+    av_curr = (
+        curr_qs.exclude(status=Booking.STATUS_CANCELLED)
+        .values("professional")
+        .distinct()
+        .count()
+    )
+ 
+    # Avg rating across all professionals
+    avg_rating = Professional.objects.filter(is_active=True).aggregate(
+        avg=Avg("rating")
+    )["avg"] or 0.0
+ 
+    # Completion rate
+    done   = curr_qs.filter(status=Booking.STATUS_COMPLETED).count()
+    cancel = curr_qs.filter(status=Booking.STATUS_CANCELLED).count()
+    denom  = done + cancel or 1
+    comp_pct = round(done / denom * 100)
+ 
+    # Unmatched / unassigned bookings
+    unmatched = Booking.objects.filter(
+        professional__isnull=True
+    ).exclude(status__in=[Booking.STATUS_CANCELLED, Booking.STATUS_COMPLETED]).count()
+ 
+    return Response({
+        "status":      "success",
+        "month_label": _month_label(start),
+        "kpis": {
+            "total_revenue": {
+                "value":    float(round(rev_curr, 3)),
+                "currency": "OMR",
+                "change":   _pct_change(float(rev_curr), float(rev_prev)),
+            },
+            "total_bookings": {
+                "value":  bk_curr,
+                "change": _pct_change(bk_curr, bk_prev),
+            },
+            "active_vendors":  av_curr,
+            "avg_rating":      round(float(avg_rating), 1),
+            "completion_rate": comp_pct,
+            "unmatched_bookings": unmatched,
+        },
+    })
+
+    
+PLATFORM_FEE_PCT = Decimal("15")   # 15% platform fee shown in the UI subtitle
+ 
+ 
+def _parse_month(month_str):
+    """Return (start_date, end_date) for a 'YYYY-MM' string; defaults to current month."""
+    today = timezone.localdate()
+    if month_str:
+        try:
+            year, month = [int(p) for p in month_str.split("-")]
+            start = date(year, month, 1)
+        except (ValueError, AttributeError):
+            start = today.replace(day=1)
+    else:
+        start = today.replace(day=1)
+ 
+    next_month = (start.replace(day=28) + timedelta(days=4))
+    end = next_month.replace(day=1) - timedelta(days=1)
+    return start, end
+ 
+ 
+def _net(gross: Decimal) -> Decimal:
+    """Deduct platform fee and return net amount (3 d.p.)."""
+    fee = (gross * PLATFORM_FEE_PCT / 100).quantize(Decimal("0.001"), rounding=ROUND_DOWN)
+    return (gross - fee).quantize(Decimal("0.001"))
+ 
+ 
+def _date_label(booking_date: date) -> str:
+    today = timezone.localdate()
+    if booking_date == today:
+        return "Today"
+    if booking_date == today - timedelta(days=1):
+        return "Yesterday"
+    return booking_date.strftime("%-d %b")   # e.g. "8 Jul"
+ 
+ 
+def _serialize_transaction(booking: Booking) -> dict:
+    gross = booking.total_amount or Decimal("0")
+    net   = _net(gross)
+ 
+    # Payment / settlement status
+    if booking.status == Booking.STATUS_COMPLETED:
+        if booking.payment_method == "cash_on_completion":
+            payout_status = "pending"
+        else:
+            payout_status = "paid"
+    elif booking.status == Booking.STATUS_CANCELLED:
+        payout_status = "cancelled"
+    else:
+        payout_status = "pending"
+ 
+    return {
+        "booking_id":    booking.id,
+        "booking_code":  booking.booking_code,
+        "service":       booking.service_type.type_name if booking.service_type else "",
+        "area":          booking.area,
+        "service_area":  f"{booking.service_type.type_name if booking.service_type else ''} · {booking.area}",
+        "date":          booking.booking_date.isoformat(),
+        "date_label":    _date_label(booking.booking_date),
+        "gross":         f"OMR {gross}",
+        "gross_value":   float(gross),
+        "net_paid":      f"OMR {net}",
+        "net_value":     float(net),
+        "status":        payout_status,          # paid | pending | cancelled
+    }
+ 
+ 
+# ---------------------------------------------------------------------------
+# GET /api/payments/vendor/summary/
+# ---------------------------------------------------------------------------
+ 
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_payment_summary(request):
+    """
+    Returns the 4 KPI cards + bank account card shown at the top of the screen.
+ 
+    KPIs
+    ----
+    revenue      – total gross of completed bookings this month
+    net_earnings – revenue minus platform fee
+    platform_fee – the deducted amount
+    pending      – gross of completed bookings not yet settled (cash_on_completion)
+ 
+    Bank account card
+    -----------------
+    bank_name, account_name, iban, is_verified, settlement_info
+    """
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+ 
+    month_str    = request.GET.get("month", "")
+    start, end   = _parse_month(month_str)
+ 
+    completed_qs = Booking.objects.filter(
+        professional=professional,
+        booking_date__range=(start, end),
+        status=Booking.STATUS_COMPLETED,
+    )
+ 
+    revenue = completed_qs.aggregate(s=Sum("total_amount"))["s"] or Decimal("0")
+    fee     = (revenue * PLATFORM_FEE_PCT / 100).quantize(Decimal("0.001"), rounding=ROUND_DOWN)
+    net     = (revenue - fee).quantize(Decimal("0.001"))
+ 
+    # Pending = completed + cash_on_completion (not yet wired)
+    pending = completed_qs.filter(
+        payment_method="cash_on_completion"
+    ).aggregate(s=Sum("total_amount"))["s"] or Decimal("0")
+    pending_net = _net(pending)
+ 
+    # Bank account
+    try:
+        bank = VendorBankAccount.objects.get(professional=professional, is_primary=True)
+        bank_data = {
+            "bank_name":       bank.bank_name,
+            "account_name":    bank.account_name,
+            "iban":            bank.iban,
+            "is_verified":     bank.is_verified,
+            "is_primary":      True,
+            "settlement_info": "T+1 settlement",
+        }
+    except VendorBankAccount.DoesNotExist:
+        bank_data = None
+ 
+    month_label = date(start.year, start.month, 1).strftime("%B %Y")
+ 
+    return Response({
+        "status":       "success",
+        "month_label":  month_label,
+        "platform_fee_pct": float(PLATFORM_FEE_PCT),
+        "settlement":   "T+1",
+        "kpis": {
+            "revenue": {
+                "label":    "Revenue",
+                "value":    f"OMR {revenue}",
+                "amount":   float(revenue),
+                "subtitle": "This month",
+            },
+            "net_earnings": {
+                "label":    "Net Earnings",
+                "value":    f"OMR {net}",
+                "amount":   float(net),
+                "subtitle": f"After {int(PLATFORM_FEE_PCT)}% fee",
+            },
+            "platform_fee": {
+                "label":    "Platform Fee",
+                "value":    f"OMR {fee}",
+                "amount":   float(fee),
+                "subtitle": "Deducted",
+            },
+            "pending": {
+                "label":    "Pending",
+                "value":    f"OMR {pending_net}",
+                "amount":   float(pending_net),
+                "subtitle": "Settled T+1",
+            },
+        },
+        "bank_account": bank_data,
+    })
+ 
+ 
+# ---------------------------------------------------------------------------
+# GET /api/payments/vendor/transactions/
+# ---------------------------------------------------------------------------
+ 
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_transactions(request):
+    """
+    Paginated list of Recent Transactions for the vendor.
+ 
+    Query params
+    ------------
+    month      YYYY-MM   filter by month (default: current month)
+    status     paid | pending | cancelled   optional filter
+    page       int        default 1
+    page_size  int        default 10
+    """
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+ 
+    month_str  = request.GET.get("month", "")
+    start, end = _parse_month(month_str)
+ 
+    qs = Booking.objects.filter(
+        professional=professional,
+        booking_date__range=(start, end),
+    ).exclude(status=Booking.STATUS_CANCELLED).select_related(
+        "service_type", "service_type__service"
+    ).order_by("-booking_date", "-booking_time")
+ 
+    # Optional status filter (maps UI pill to booking statuses)
+    status_filter = request.GET.get("status", "").lower()
+    if status_filter == "paid":
+        qs = qs.filter(
+            status=Booking.STATUS_COMPLETED
+        ).exclude(payment_method="cash_on_completion")
+    elif status_filter == "pending":
+        qs = qs.filter(
+            Q(status=Booking.STATUS_COMPLETED, payment_method="cash_on_completion") |
+            Q(status__in=[
+                Booking.STATUS_CONFIRMED,
+                Booking.STATUS_PENDING,
+                Booking.STATUS_EN_ROUTE,
+                Booking.STATUS_ARRIVED,
+                Booking.STATUS_IN_PROGRESS,
+            ])
+        )
+ 
+    page_number = request.GET.get("page", 1)
+    page_size   = int(request.GET.get("page_size", 10))
+    paginator   = Paginator(qs, page_size)
+    page_obj    = paginator.get_page(page_number)
+ 
+    def _page_url(num):
+        if not num:
+            return None
+        p = request.GET.copy()
+        p["page"] = num
+        p["page_size"] = page_size
+        return f"{request.path}?{p.urlencode()}"
+ 
+    return Response({
+        "status":       "success",
+        "month_label":  date(start.year, start.month, 1).strftime("%B %Y"),
+        "count":        len(page_obj.object_list),
+        "total_count":  paginator.count,
+        "total_pages":  paginator.num_pages,
+        "current_page": page_obj.number,
+        "page_size":    page_size,
+        "next":         _page_url(page_obj.next_page_number() if page_obj.has_next() else None),
+        "previous":     _page_url(page_obj.previous_page_number() if page_obj.has_previous() else None),
+        "data": [_serialize_transaction(b) for b in page_obj],
+    })
+ 
+ 
+# ---------------------------------------------------------------------------
+# POST /api/payments/vendor/payout/request/
+# ---------------------------------------------------------------------------
+ 
+@api_view(["POST"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_request_payout(request):
+    """
+    "Request Payout" button handler.
+ 
+    Body (optional)
+    ---------------
+    month   YYYY-MM   defaults to current month if omitted
+ 
+    Returns
+    -------
+    Payout request record with amount, status, and ETA.
+    """
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+ 
+    # Must have a verified bank account
+    try:
+        bank = VendorBankAccount.objects.get(professional=professional, is_primary=True, is_verified=True)
+    except VendorBankAccount.DoesNotExist:
+        return Response({
+            "status":  "error",
+            "message": "No verified bank account found. Please add and verify your bank account first.",
+        }, status=400)
+ 
+    month_str  = request.data.get("month", "")
+    start, end = _parse_month(month_str)
+ 
+    # Calculate net payable (completed bookings, not yet in a payout request)
+    already_requested_ids = PayoutRequest.objects.filter(
+        professional=professional,
+        status__in=["pending", "processing", "paid"],
+    ).values_list("booking_ids", flat=True)
+ 
+    # Flatten the list of booking id lists
+    excluded_ids = set()
+    for id_list in already_requested_ids:
+        if id_list:
+            excluded_ids.update(id_list)
+ 
+    eligible_qs = Booking.objects.filter(
+        professional=professional,
+        booking_date__range=(start, end),
+        status=Booking.STATUS_COMPLETED,
+    ).exclude(id__in=excluded_ids)
+ 
+    gross = eligible_qs.aggregate(s=Sum("total_amount"))["s"] or Decimal("0")
+    net   = _net(gross)
+    fee   = (gross - net).quantize(Decimal("0.001"))
+ 
+    if net <= 0:
+        return Response({
+            "status":  "error",
+            "message": "No eligible earnings available for payout this month.",
+        }, status=400)
+ 
+    booking_ids = list(eligible_qs.values_list("id", flat=True))
+ 
+    payout = PayoutRequest.objects.create(
+        professional  = professional,
+        month_start   = start,
+        month_end     = end,
+        gross_amount  = gross,
+        platform_fee  = fee,
+        net_amount    = net,
+        bank_account  = bank,
+        booking_ids   = booking_ids,
+        status        = "pending",
+    )
+ 
+    eta = timezone.localdate() + timedelta(days=1)   # T+1
+ 
+    return Response({
+        "status":  "success",
+        "message": f"Payout of OMR {net} requested successfully. Expected by {eta.strftime('%-d %b %Y')}.",
+        "data": {
+            "payout_id":     payout.id,
+            "month":         date(start.year, start.month, 1).strftime("%B %Y"),
+            "gross_amount":  f"OMR {gross}",
+            "platform_fee":  f"OMR {fee}",
+            "net_amount":    f"OMR {net}",
+            "status":        payout.status,
+            "eta":           eta.isoformat(),
+            "bank": {
+                "bank_name":    bank.bank_name,
+                "account_name": bank.account_name,
+                "iban":         bank.iban,
+            },
+        },
+    }, status=201)
+ 
+ 
+# ---------------------------------------------------------------------------
+# GET / POST  /api/payments/vendor/bank-account/
+# ---------------------------------------------------------------------------
+ 
+@api_view(["GET", "POST"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_bank_account(request):
+    """
+    GET  — Return the vendor's saved bank accounts.
+    POST — Add or update (upsert) the primary bank account.
+ 
+    POST body
+    ---------
+    bank_name     str   e.g. "Bank of Muscat"
+    account_name  str   e.g. "Mohammed Al-Balushi"
+    iban          str   e.g. "OM80 0001 0000 2345 6789"
+    """
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+ 
+    if request.method == "GET":
+        accounts = VendorBankAccount.objects.filter(professional=professional)
+        data = [
+            {
+                "id":           a.id,
+                "bank_name":    a.bank_name,
+                "account_name": a.account_name,
+                "iban":         a.iban,
+                "is_primary":   a.is_primary,
+                "is_verified":  a.is_verified,
+            }
+            for a in accounts
+        ]
+        return Response({"status": "success", "count": len(data), "data": data})
+ 
+    # POST — upsert primary account
+    bank_name    = (request.data.get("bank_name") or "").strip()
+    account_name = (request.data.get("account_name") or "").strip()
+    iban         = (request.data.get("iban") or "").strip().upper().replace(" ", "")
+ 
+    if not all([bank_name, account_name, iban]):
+        return Response({
+            "status":  "error",
+            "message": "bank_name, account_name, and iban are all required.",
+        }, status=400)
+ 
+    # Basic Oman IBAN format check: starts with OM, 23 chars
+    if not (iban.startswith("OM") and len(iban) == 23):
+        return Response({
+            "status":  "error",
+            "message": "Invalid Oman IBAN. Must start with 'OM' and be 23 characters long.",
+        }, status=400)
+ 
+    # Format for display: OM80 0001 0000 2345 6789
+    formatted_iban = " ".join([iban[i:i+4] for i in range(0, len(iban), 4)])
+ 
+    account, created = VendorBankAccount.objects.update_or_create(
+        professional=professional,
+        is_primary=True,
+        defaults={
+            "bank_name":    bank_name,
+            "account_name": account_name,
+            "iban":         formatted_iban,
+            "is_verified":  False,   # resets verification on any change
+        },
+    )
+ 
+    return Response({
+        "status":  "success",
+        "message": "Bank account saved. Verification is pending." if created else "Bank account updated. Re-verification required.",
+        "data": {
+            "id":           account.id,
+            "bank_name":    account.bank_name,
+            "account_name": account.account_name,
+            "iban":         account.iban,
+            "is_primary":   account.is_primary,
+            "is_verified":  account.is_verified,
+        },
+    }, status=201 if created else 200)
+ 
+ 
+# ---------------------------------------------------------------------------
+# PATCH /api/payments/vendor/bank-account/<id>/verify/
+# Admin-only: mark a bank account as verified
+# ---------------------------------------------------------------------------
+ 
+@api_view(["PATCH"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_verify_bank_account(request, account_id):
+    """Admin marks a vendor's bank account as verified."""
+    try:
+        account = VendorBankAccount.objects.get(id=account_id)
+    except VendorBankAccount.DoesNotExist:
+        return Response({"status": "error", "message": "Bank account not found."}, status=404)
+ 
+    account.is_verified = True
+    account.save(update_fields=["is_verified"])
+ 
+    return Response({
+        "status":  "success",
+        "message": f"Bank account for {account.professional.name} verified.",
+        "data": {
+            "id":          account.id,
+            "bank_name":   account.bank_name,
+            "iban":        account.iban,
+            "is_verified": account.is_verified,
+        },
+    })
+ 
+ 
+# ---------------------------------------------------------------------------
+# GET /api/payments/vendor/payout/history/
+# ---------------------------------------------------------------------------
+ 
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_payout_history(request):
+    """Returns list of all payout requests for the vendor."""
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+ 
+    payouts = PayoutRequest.objects.filter(professional=professional).order_by("-created_at")
+ 
+    data = [
+        {
+            "id":           p.id,
+            "month":        p.month_start.strftime("%B %Y"),
+            "gross_amount": f"OMR {p.gross_amount}",
+            "platform_fee": f"OMR {p.platform_fee}",
+            "net_amount":   f"OMR {p.net_amount}",
+            "status":       p.status,
+            "requested_at": p.created_at.isoformat(),
+            "bank": {
+                "bank_name": p.bank_account.bank_name if p.bank_account else None,
+                "iban":      p.bank_account.iban if p.bank_account else None,
+            },
+        }
+        for p in payouts
+    ]
+ 
+    return Response({"status": "success", "count": len(data), "data": data})

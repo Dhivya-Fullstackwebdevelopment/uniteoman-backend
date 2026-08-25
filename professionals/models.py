@@ -284,3 +284,53 @@ class ProfessionalArea(models.Model):
 
     class Meta:
         unique_together = ("professional", "area")
+
+         
+class VendorBankAccount(models.Model):
+    professional  = models.ForeignKey(Professional, on_delete=models.CASCADE, related_name="bank_accounts")
+    bank_name     = models.CharField(max_length=100)          # "Bank of Muscat"
+    account_name  = models.CharField(max_length=150)          # "Mohammed Al-Balushi"
+    iban          = models.CharField(max_length=40)           # "OM80 0001 0000 2345 6789"
+    is_primary    = models.BooleanField(default=True)
+    is_verified   = models.BooleanField(default=False)        # admin verifies
+    created_at    = models.DateTimeField(auto_now_add=True)
+    updated_at    = models.DateTimeField(auto_now=True)
+ 
+    class Meta:
+        unique_together = ("professional", "is_primary")     # one primary per vendor
+ 
+    def __str__(self):
+        return f"{self.professional.name} — {self.bank_name} ({self.iban})"
+ 
+ 
+class PayoutRequest(models.Model):
+    STATUS_PENDING    = "pending"
+    STATUS_PROCESSING = "processing"
+    STATUS_PAID       = "paid"
+    STATUS_FAILED     = "failed"
+    STATUS_CHOICES = [
+        (STATUS_PENDING,    "Pending"),
+        (STATUS_PROCESSING, "Processing"),
+        (STATUS_PAID,       "Paid"),
+        (STATUS_FAILED,     "Failed"),
+    ]
+ 
+    professional  = models.ForeignKey(Professional, on_delete=models.CASCADE, related_name="payout_requests")
+    bank_account  = models.ForeignKey(VendorBankAccount, on_delete=models.SET_NULL, null=True, blank=True)
+    month_start   = models.DateField()
+    month_end     = models.DateField()
+    gross_amount  = models.DecimalField(max_digits=12, decimal_places=3)
+    platform_fee  = models.DecimalField(max_digits=12, decimal_places=3)
+    net_amount    = models.DecimalField(max_digits=12, decimal_places=3)
+    booking_ids   = models.JSONField(default=list)            # snapshot of included booking IDs
+    status        = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    admin_note    = models.TextField(blank=True)
+    created_at    = models.DateTimeField(auto_now_add=True)
+    updated_at    = models.DateTimeField(auto_now=True)
+ 
+    class Meta:
+        ordering = ["-created_at"]
+ 
+    def __str__(self):
+        return f"{self.professional.name} — {self.month_start.strftime('%b %Y')} — OMR {self.net_amount} [{self.status}]"
+ 

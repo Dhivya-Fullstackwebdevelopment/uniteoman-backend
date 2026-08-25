@@ -24,7 +24,24 @@ from .views import (
     admin_review_moderation,
     admin_moderate_review,
     professional_reviews_public,
+    edit_review,
 )
+from .views import (
+    vendor_analytics,
+    admin_analytics,
+    admin_kpis,
+    admin_send_retention_offer,
+)
+from .views import (
+    vendor_payment_summary,
+    vendor_transactions,
+    vendor_request_payout,
+    vendor_bank_account,
+    admin_verify_bank_account,
+    vendor_payout_history,
+)
+ 
+ 
 
 urlpatterns = [
     # Professional List + Filters
@@ -98,4 +115,56 @@ urlpatterns = [
     # PUBLIC: customer-facing published reviews for a professional
     # GET   /api/professionals/<pk>/reviews/
     path("<int:pk>/reviews/", professional_reviews_public, name="professional_reviews_public"),
+    path("bookings/<int:booking_id>/review/edit/", views.edit_review, name="edit_review"),
+    path("bookings/<int:booking_id>/review/detail/", views.get_booking_review, name="get_booking_review"),
+
+    # ── Vendor Dashboard (Image 1) ─────────────────────────────────────────
+    # GET /api/analytics/vendor/?month=YYYY-MM&ai=on
+    path("vendor/", vendor_analytics, name="vendor_analytics"),
+ 
+    # ── Admin Dashboard (Image 2) ──────────────────────────────────────────
+    # GET /api/analytics/admin/?month=YYYY-MM&ai=on
+    path("admin/", admin_analytics, name="admin_analytics"),
+ 
+    # GET /api/analytics/admin/kpis/?month=YYYY-MM
+    path("admin/kpis/", admin_kpis, name="admin_kpis"),
+ 
+    # POST /api/analytics/admin/churn/<professional_id>/retention/
+    path(
+        "admin/churn/<int:professional_id>/retention/",
+        admin_send_retention_offer,
+        name="admin_send_retention_offer",
+    ),
+
+      # 4 KPI cards + bank account card
+    # GET /api/payments/vendor/summary/?month=2026-07
+    path("vendor/summary/", vendor_payment_summary, name="vendor_payment_summary"),
+ 
+    # Recent Transactions table (paginated)
+    # GET /api/payments/vendor/transactions/?month=2026-07&status=paid&page=1
+    path("vendor/transactions/", vendor_transactions, name="vendor_transactions"),
+ 
+    # "Request Payout" button
+    # POST /api/payments/vendor/payout/request/
+    path("vendor/payout/request/", vendor_request_payout, name="vendor_request_payout"),
+ 
+    # Payout history list
+    # GET /api/payments/vendor/payout/history/
+    path("vendor/payout/history/", vendor_payout_history, name="vendor_payout_history"),
+ 
+    # Bank account — GET list / POST add-or-update
+    # GET  /api/payments/vendor/bank-account/
+    # POST /api/payments/vendor/bank-account/
+    path("vendor/bank-account/", vendor_bank_account, name="vendor_bank_account"),
+ 
+    # ── Admin ─────────────────────────────────────────────────────────────
+ 
+    # Mark a bank account as verified
+    # PATCH /api/payments/admin/bank-account/<id>/verify/
+    path(
+        "admin/bank-account/<int:account_id>/verify/",
+        admin_verify_bank_account,
+        name="admin_verify_bank_account",
+    ),
+
 ]
