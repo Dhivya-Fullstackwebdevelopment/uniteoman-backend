@@ -3538,8 +3538,7 @@ def _date_label(booking_date: date) -> str:
         return "Today"
     if booking_date == today - timedelta(days=1):
         return "Yesterday"
-    return booking_date.strftime("%-d %b")   # e.g. "8 Jul"
- 
+    return booking_date.strftime("%d %b").lstrip("0")
  
 def _serialize_transaction(booking: Booking) -> dict:
     gross = booking.total_amount or Decimal("0")
@@ -3995,3 +3994,371 @@ def vendor_payout_history(request):
     ]
  
     return Response({"status": "success", "count": len(data), "data": data})
+
+
+    # ---------------------------------------------------------------------------
+# ── ADMIN: Payments Dashboard (Image: Payments screen)
+# GET /api/analytics/admin/payments/summary/?month=YYYY-MM
+# ---------------------------------------------------------------------------
+
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_payments_summary(request):
+    """
+    KPI cards for the top of the admin Payments screen:
+    Gross Revenue, Platform Commission, Pending Payouts, Credits Revenue.
+    """
+    month_str = request.GET.get("month", "")
+    start, end = _parse_month(month_str)
+
+    prev_end = start - timedelta(days=1)
+    prev_start = prev_end.replace(day=1)
+
+    curr_qs = Booking.objects.filter(booking_date__range=(start, end))
+    prev_qs = Booking.objects.filter(booking_date__range=(prev_start, prev_end))
+
+    gross_curr = curr_qs.filter(status=Booking.STATUS_COMPLETED).aggregate(
+        s=Sum("total_amount")
+    )["s"] or Decimal("0")
+    gross_prev = prev_qs.filter(status=Booking.STATUS_COMPLETED).aggregate(
+        s=Sum("total_amount")
+    )["s"] or Decimal("0")
+
+    commission_curr = curr_qs.filter(status=Booking.STATUS_COMPLETED).aggregate(
+        s=Sum("platform_fee")
+    )["s"] or Decimal("0")
+
+    commission_pct = round(
+        float(commission_curr) / float(gross_curr) * 100
+    ) if gross_curr else 0
+
+    pending_payouts_qs = PayoutRequest.objects.filter(
+        status="pending", month_start__range=(start, end)
+    )
+    pending_total = pending_payouts_qs.aggregate(s=Sum("net_amount"))["s"] or Decimal("0")
+    pending_vendor_count = pending_payouts_qs.values("professional").distinct().count()
+
+    return Response({
+        "status": "success",
+        "month_label": _month_label(start),
+        "kpis": {
+            "gross_revenue": {
+                "value": float(round(gross_curr, 3)),
+                "currency": "OMR",
+                "change": _pct_change(float(gross_curr), float(gross_prev)),
+            },
+            "platform_commission": {
+                "value": float(round(commission_curr, 3)),
+                "currency": "OMR",
+                "pct_of_gross": commission_pct,
+            },
+            "pending_payouts": {
+                "value": float(round(pending_total, 3)),
+                "currency": "OMR",
+                "settlement": "T+1",
+                "vendor_count": pending_vendor_count,
+            },
+            "credits_revenue": None,  # No Credits/Subscription model exists yet
+        },
+    })
+
+
+# ---------------------------------------------------------------------------
+# ── ADMIN: Customer Payments tab
+# GET /api/analytics/admin/payments/customer/?month=YYYY-MM&status=&page=1
+# ---------------------------------------------------------------------------
+
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_customer_payments(request):
+    month_str = request.GET.get("month", "")
+    start, end = _parse_month(month_str)
+
+    qs = Booking.objects.filter(
+        booking_date__range=(start, end)
+    ).select_related("professional", "service_type").order_by("-created_at")
+
+    status_filter = request.GET.get("status", "").lower()
+    if status_filter == "captured":
+        qs = qs.filter(status=Booking.STATUS_COMPLETED).exclude(
+            payment_method="cash_on_completion"
+        )
+    elif status_filter == "held":
+        qs = qs.filter(
+            status__in=[Booking.STATUS_PENDING, Booking.STATUS_CONFIRMED,
+                        Booking.STATUS_EN_ROUTE, Booking.STATUS_ARRIVED,
+                        Booking.STATUS_IN_PROGRESS]
+        )
+    elif status_filter == "refunded":
+        qs = qs.filter(status=Booking.STATUS_CANCELLED)  # stopgap — see note below
+
+    page_number = request.GET.get("page", 1)
+    page_size = int(request.GET.get("page_size", 10))
+    paginator = Paginator(qs, page_size)
+    page_obj = paginator.get_page(page_number)
+
+    def _status_label(b):
+        if b.status == Booking.STATUS_COMPLETED:
+            return "captured" if b.payment_method != "cash_on_completion" else "held"
+        if b.status == Booking.STATUS_CANCELLED:
+            return "refunded"
+        return "held"
+
+    data = []
+    for b in page_obj:
+        data.append({
+            "booking_id": f"#{b.id}",
+            "customer": b.user_name,
+            "vendor": b.professional.name if b.professional else "Unassigned",
+            "amount": f"OMR {b.total_amount}",
+            "gateway": b.get_payment_method_display(),
+            "date_label": _date_label(b.booking_date),
+            "status": _status_label(b),
+        })
+
+    return Response({
+        "status": "success",
+        "count": len(data),
+        "total_count": paginator.count,
+        "total_pages": paginator.num_pages,
+        "current_page": page_obj.number,
+        "data": data,
+    })
+
+
+# ---------------------------------------------------------------------------
+# ── ADMIN: Vendor Payouts tab
+# GET /api/analytics/admin/payments/vendor-payouts/?month=YYYY-MM&status=&page=1
+# ---------------------------------------------------------------------------
+
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_vendor_payouts(request):
+    month_str = request.GET.get("month", "")
+    start, end = _parse_month(month_str)
+
+    qs = PayoutRequest.objects.filter(
+        month_start__range=(start, end)
+    ).select_related("professional", "bank_account").order_by("-created_at")
+
+    status_filter = request.GET.get("status", "").lower()
+    if status_filter:
+        qs = qs.filter(status=status_filter)
+
+    page_number = request.GET.get("page", 1)
+    page_size = int(request.GET.get("page_size", 10))
+    paginator = Paginator(qs, page_size)
+    page_obj = paginator.get_page(page_number)
+
+    data = [
+        {
+            "payout_id": p.id,
+            "vendor": p.professional.name,
+            "gross_amount": f"OMR {p.gross_amount}",
+            "platform_fee": f"OMR {p.platform_fee}",
+            "net_amount": f"OMR {p.net_amount}",
+            "bank": p.bank_account.bank_name if p.bank_account else None,
+            "status": p.status,
+            "requested_at": p.created_at.isoformat(),
+        }
+        for p in page_obj
+    ]
+
+    return Response({
+        "status": "success",
+        "count": len(data),
+        "total_count": paginator.count,
+        "total_pages": paginator.num_pages,
+        "current_page": page_obj.number,
+        "data": data,
+    })
+
+
+# ---------------------------------------------------------------------------
+# ── ADMIN: Platform Revenue tab
+# GET /api/analytics/admin/payments/platform-revenue/?month=YYYY-MM
+# ---------------------------------------------------------------------------
+
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_platform_revenue(request):
+    month_str = request.GET.get("month", "")
+    start, end = _parse_month(month_str)
+
+    qs = Booking.objects.filter(
+        booking_date__range=(start, end), status=Booking.STATUS_COMPLETED
+    )
+
+    by_service = (
+        qs.values(service_name=models_F("service_type__service__name"))
+        .annotate(fee_sum=Sum("platform_fee"), booking_count=Count("id"))
+        .order_by("-fee_sum")
+    )
+
+    total_fee = qs.aggregate(s=Sum("platform_fee"))["s"] or Decimal("0")
+
+    return Response({
+        "status": "success",
+        "month_label": _month_label(start),
+        "total_platform_revenue": float(round(total_fee, 3)),
+        "breakdown_by_service": [
+            {
+                "service": r["service_name"] or "Other",
+                "revenue": float(round(r["fee_sum"] or 0, 3)),
+                "booking_count": r["booking_count"],
+            }
+            for r in by_service
+        ],
+    })
+
+
+# ---------------------------------------------------------------------------
+# ── ADMIN: Refunds tab  (STOPGAP — no dedicated Refund model exists yet)
+# GET /api/analytics/admin/payments/refunds/?month=YYYY-MM&page=1
+# ---------------------------------------------------------------------------
+
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_refunds(request):
+    """
+    NOTE: There is no Refund model in this codebase. This treats
+    CANCELLED bookings as a proxy for refunds, which is not fully
+    accurate (a booking can be cancelled before any payment was ever
+    captured, meaning nothing was actually refunded). Recommend adding
+    a proper `refund_status` / `refunded_amount` field on Booking, or
+    a separate Refund model, before shipping this tab to production.
+    """
+    month_str = request.GET.get("month", "")
+    start, end = _parse_month(month_str)
+
+    qs = Booking.objects.filter(
+        booking_date__range=(start, end), status=Booking.STATUS_CANCELLED
+    ).select_related("professional").order_by("-updated_at")
+
+    page_number = request.GET.get("page", 1)
+    page_size = int(request.GET.get("page_size", 10))
+    paginator = Paginator(qs, page_size)
+    page_obj = paginator.get_page(page_number)
+
+    data = [
+        {
+            "booking_id": f"#{b.id}",
+            "customer": b.user_name,
+            "vendor": b.professional.name if b.professional else "Unassigned",
+            "amount": f"OMR {b.total_amount}",
+            "date_label": _date_label(b.booking_date),
+        }
+        for b in page_obj
+    ]
+
+    return Response({
+        "status": "success",
+        "count": len(data),
+        "total_count": paginator.count,
+        "total_pages": paginator.num_pages,
+        "current_page": page_obj.number,
+        "data": data,
+        "note": "Derived from cancelled bookings — not a true refund ledger.",
+    })
+
+
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_payments_export(request):
+    """
+    Exports the currently active Payments tab as CSV, respecting the
+    same month/status filters as the on-screen table.
+    """
+    month_str = request.GET.get("month", "")
+    export_type = request.GET.get("type", "customer").lower()
+    status_filter = request.GET.get("status", "").lower()
+    start, end = _parse_month(month_str)
+
+    response = HttpResponse(content_type="text/csv")
+    filename = f"payments_{export_type}_{start.strftime('%Y_%m')}.csv"
+    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+    writer = csv.writer(response)
+
+    if export_type == "customer":
+        qs = Booking.objects.filter(
+            booking_date__range=(start, end)
+        ).select_related("professional", "service_type").order_by("-created_at")
+
+        if status_filter == "captured":
+            qs = qs.filter(status=Booking.STATUS_COMPLETED).exclude(
+                payment_method="cash_on_completion"
+            )
+        elif status_filter == "held":
+            qs = qs.filter(
+                status__in=[Booking.STATUS_PENDING, Booking.STATUS_CONFIRMED,
+                            Booking.STATUS_EN_ROUTE, Booking.STATUS_ARRIVED,
+                            Booking.STATUS_IN_PROGRESS]
+            )
+        elif status_filter == "refunded":
+            qs = qs.filter(status=Booking.STATUS_CANCELLED)
+
+        writer.writerow(["Booking ID", "Customer", "Vendor", "Amount (OMR)", "Gateway", "Date", "Status"])
+        for b in qs:
+            vendor = b.professional.name if b.professional else "Unassigned"
+            if b.status == Booking.STATUS_COMPLETED:
+                status_label = "Captured" if b.payment_method != "cash_on_completion" else "Held"
+            elif b.status == Booking.STATUS_CANCELLED:
+                status_label = "Refunded"
+            else:
+                status_label = "Held"
+            writer.writerow([
+                f"#{b.id}", b.user_name, vendor, b.total_amount,
+                b.get_payment_method_display(), b.booking_date.strftime("%d %b %Y"),
+                status_label,
+            ])
+
+    elif export_type == "vendor_payouts":
+        qs = PayoutRequest.objects.filter(
+            month_start__range=(start, end)
+        ).select_related("professional", "bank_account").order_by("-created_at")
+
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+
+        writer.writerow(["Payout ID", "Vendor", "Gross (OMR)", "Platform Fee (OMR)", "Net (OMR)", "Bank", "Status", "Requested At"])
+        for p in qs:
+            writer.writerow([
+                p.id, p.professional.name, p.gross_amount, p.platform_fee, p.net_amount,
+                p.bank_account.bank_name if p.bank_account else "",
+                p.status, p.created_at.strftime("%d %b %Y %H:%M"),
+            ])
+
+    elif export_type == "platform_revenue":
+        qs = Booking.objects.filter(
+            booking_date__range=(start, end), status=Booking.STATUS_COMPLETED
+        ).values(service_name=models_F("service_type__service__name")).annotate(
+            fee_sum=Sum("platform_fee"), booking_count=Count("id")
+        ).order_by("-fee_sum")
+
+        writer.writerow(["Service", "Platform Revenue (OMR)", "Booking Count"])
+        for r in qs:
+            writer.writerow([r["service_name"] or "Other", r["fee_sum"] or 0, r["booking_count"]])
+
+    elif export_type == "refunds":
+        qs = Booking.objects.filter(
+            booking_date__range=(start, end), status=Booking.STATUS_CANCELLED
+        ).select_related("professional").order_by("-updated_at")
+
+        writer.writerow(["Booking ID", "Customer", "Vendor", "Amount (OMR)", "Date"])
+        for b in qs:
+            vendor = b.professional.name if b.professional else "Unassigned"
+            writer.writerow([f"#{b.id}", b.user_name, vendor, b.total_amount, b.booking_date.strftime("%d %b %Y")])
+
+    else:
+        return Response({
+            "status": "error",
+            "message": "Invalid type. Use customer, vendor_payouts, platform_revenue, or refunds.",
+        }, status=400)
+
+    return response

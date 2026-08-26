@@ -40,7 +40,14 @@ from .views import (
     admin_verify_bank_account,
     vendor_payout_history,
 )
- 
+from .views import (
+    admin_payments_summary,
+    admin_customer_payments,
+    admin_vendor_payouts,
+    admin_platform_revenue,
+    admin_refunds,
+    admin_payments_export,
+)
  
 
 urlpatterns = [
@@ -166,5 +173,11 @@ urlpatterns = [
         admin_verify_bank_account,
         name="admin_verify_bank_account",
     ),
+    path("admin/payments/summary/", admin_payments_summary, name="admin_payments_summary"),
+    path("admin/payments/customer/", admin_customer_payments, name="admin_customer_payments"),
+    path("admin/payments/vendor-payouts/", admin_vendor_payouts, name="admin_vendor_payouts"),
+    path("admin/payments/platform-revenue/", admin_platform_revenue, name="admin_platform_revenue"),
+    path("admin/payments/refunds/", admin_refunds, name="admin_refunds"),
+    path("admin/payments/export/", admin_payments_export, name="admin_payments_export"),
 
 ]
