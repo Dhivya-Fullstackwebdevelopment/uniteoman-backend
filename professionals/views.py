@@ -48,6 +48,9 @@ from .models import VendorBankAccount, PayoutRequest
 from django.db.models import Sum, Count, Q
 from professionals.models import Professional, Booking
 from decimal import Decimal, ROUND_DOWN
+from .models import (
+    VendorSubscription, SubscriptionPlan, CreditTransaction, VendorLocation
+)
 
 User = get_user_model()
 
@@ -3828,7 +3831,7 @@ def vendor_request_payout(request):
  
     return Response({
         "status":  "success",
-        "message": f"Payout of OMR {net} requested successfully. Expected by {eta.strftime('%-d %b %Y')}.",
+        "message": f"Payout of OMR {net} requested successfully. Expected by {eta.strftime('%d %b %Y').lstrip('0')}.",
         "data": {
             "payout_id":     payout.id,
             "month":         date(start.year, start.month, 1).strftime("%B %Y"),
@@ -4362,3 +4365,543 @@ def admin_payments_export(request):
         }, status=400)
 
     return response
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LIVE MAP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ---------------------------------------------------------------------------
+# PATCH /api/professionals/vendor/location/
+# Body: { "latitude": 23.5880, "longitude": 58.3829, "area_label": "Al Khuwair · Muscat" }
+# ---------------------------------------------------------------------------
+
+@api_view(["PATCH"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_update_location(request):
+    """Vendor app pings current GPS coords (called every ~30 s from mobile)."""
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    lat = request.data.get("latitude")
+    lng = request.data.get("longitude")
+    if lat is None or lng is None:
+        return Response({"status": "error", "message": "latitude and longitude are required."}, status=400)
+
+    loc, _ = VendorLocation.objects.update_or_create(
+        professional=professional,
+        defaults={
+            "latitude": lat,
+            "longitude": lng,
+            "area_label": request.data.get("area_label", ""),
+        },
+    )
+
+    return Response({
+        "status": "success",
+        "message": "Location updated.",
+        "data": {
+            "latitude": float(loc.latitude),
+            "longitude": float(loc.longitude),
+            "area_label": loc.area_label,
+            "updated_at": loc.updated_at.isoformat(),
+        },
+    })
+
+
+# ---------------------------------------------------------------------------
+# GET /api/professionals/vendor/live-map/
+# ---------------------------------------------------------------------------
+
+ONGOING_STATUSES = [
+    Booking.STATUS_EN_ROUTE,
+    Booking.STATUS_ARRIVED,
+    Booking.STATUS_IN_PROGRESS,
+]
+UPCOMING_STATUSES = [
+    Booking.STATUS_SCHEDULED,
+    Booking.STATUS_PENDING,
+    Booking.STATUS_CONFIRMED,
+]
+
+
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_live_map(request):
+    """
+    Returns everything the Live Map screen needs:
+    - vendor's current GPS position
+    - active job (the booking currently in-progress / en-route)
+    - next upcoming job today
+    - my-status summary (coverage areas, online-since, jobs today)
+
+    Map pin data for the active job and upcoming job (lat/lng of the
+    customer's address) is included so the frontend can plot markers.
+    """
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    today = timezone.localdate()
+
+    # ── Vendor GPS ────────────────────────────────────────────────────────
+    try:
+        loc = professional.location
+        vendor_position = {
+            "latitude": float(loc.latitude),
+            "longitude": float(loc.longitude),
+            "area_label": loc.area_label,
+            "last_updated": loc.updated_at.isoformat(),
+        }
+    except VendorLocation.DoesNotExist:
+        vendor_position = None
+
+    # ── Active Job ────────────────────────────────────────────────────────
+    active_booking = (
+        Booking.objects.filter(
+            professional=professional,
+            status__in=ONGOING_STATUSES,
+        )
+        .select_related("service_type")
+        .order_by("booking_date", "booking_time")
+        .first()
+    )
+
+    active_job = None
+    if active_booking:
+        active_job = {
+            "booking_id":   active_booking.id,
+            "booking_code": active_booking.booking_code,
+            "label":        "Active Job #1",
+            "service_name": active_booking.service_type.type_name if active_booking.service_type else "",
+            "customer_name": active_booking.user_name,
+            "area":          active_booking.area,
+            "status":        active_booking.status,
+            "status_display": active_booking.get_status_display(),
+            # Customer address coords (for map pin "1")
+            "latitude":  float(active_booking.latitude) if active_booking.latitude else None,
+            "longitude": float(active_booking.longitude) if active_booking.longitude else None,
+            # Rough distance & ETA — replace with a real routing call in prod
+            "distance_km": 1.2,
+            "eta_minutes": 12,
+        }
+
+    # ── Next Upcoming Job ─────────────────────────────────────────────────
+    upcoming_booking = (
+        Booking.objects.filter(
+            professional=professional,
+            booking_date=today,
+            status__in=UPCOMING_STATUSES,
+        )
+        .select_related("service_type")
+        .order_by("booking_time")
+        .first()
+    )
+
+    upcoming_job = None
+    if upcoming_booking:
+         scheduled_label = (
+           upcoming_booking.booking_time.strftime("%I:%M %p").lstrip("0").lower() + " today"
+         )
+         upcoming_job = {
+            "booking_id":    upcoming_booking.id,
+            "booking_code":  upcoming_booking.booking_code,
+            "label":         "Upcoming Job #2",
+            "service_name":  upcoming_booking.service_type.type_name if upcoming_booking.service_type else "",
+            "customer_name": upcoming_booking.user_name,
+            "area":          upcoming_booking.area,
+            "scheduled":     scheduled_label,
+            "status":        upcoming_booking.status,
+            # Customer address coords (for map pin "2")
+            "latitude":  float(upcoming_booking.latitude) if upcoming_booking.latitude else None,
+            "longitude": float(upcoming_booking.longitude) if upcoming_booking.longitude else None,
+        }
+
+    # ── My Status ─────────────────────────────────────────────────────────
+    # "Online since" = earliest booking today or fallback to now
+    first_booking_today = (
+        Booking.objects.filter(professional=professional, booking_date=today)
+        .order_by("booking_time")
+        .first()
+    )
+    if first_booking_today:
+        online_since = first_booking_today.booking_time.strftime("%I:%M %p").lstrip("0")
+    else:
+        online_since = timezone.localtime().strftime("%I:%M %p").lstrip("0")
+
+    coverage_areas = list(
+        professional.service_areas.values_list("area", flat=True)
+    )
+
+    jobs_today_qs = Booking.objects.filter(professional=professional, booking_date=today)
+    jobs_today_total = jobs_today_qs.count()
+    jobs_today_done  = jobs_today_qs.filter(status=Booking.STATUS_COMPLETED).count()
+
+    my_status = {
+        "coverage_areas":       coverage_areas,
+        "coverage_areas_count": len(coverage_areas),
+        "online_since":         online_since,
+        "jobs_today":           jobs_today_total,
+        "jobs_today_done":      jobs_today_done,
+        "jobs_today_label":     f"{jobs_today_total} ({jobs_today_done} done)",
+    }
+
+    return Response({
+        "status":          "success",
+        "vendor_position": vendor_position,
+        "active_job":      active_job,
+        "upcoming_job":    upcoming_job,
+        "my_status":       my_status,
+        # Legend for the map
+        "legend": [
+            {"color": "purple", "label": "You"},
+            {"color": "orange", "label": "Active job"},
+            {"color": "blue",   "label": "Upcoming"},
+        ],
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CREDITS & PLANS
+# ═══════════════════════════════════════════════════════════════════════════════
+def _serialize_plan(plan, current_plan_id):
+    """
+    Serialize one SubscriptionPlan for the UI card.
+    cta_label / cta_disabled drive the button state:
+      - Current plan  → grey "Current Plan" button (disabled)
+      - Other plans   → purple "Upgrade →" button (enabled)
+    """
+    is_current = plan.id == current_plan_id
+
+    # Feature bullet list — matches exactly what's in the UI
+    features = []
+    if plan.credits:
+        features.append(f"{plan.credits} booking leads/mo")
+    else:
+        features.append("Unlimited leads")
+
+    dispatch_map = {
+        "standard":   "Standard dispatch priority",
+        "priority":   "Priority dispatch",
+        "top":        "Top priority dispatch",
+        "guaranteed": "Guaranteed dispatch",
+    }
+    features.append(dispatch_map.get(plan.dispatch_priority, "Standard dispatch priority"))
+
+    if plan.ai_job_matching:
+        features.append("AI job matching")
+
+    if plan.dedicated_manager:
+        features.append("Dedicated account manager")
+
+    support_map = {
+        "email":       "Email support",
+        "chat":        "Chat support",
+        "white_glove": "White-glove support",
+    }
+    if plan.support_level in support_map:
+        features.append(support_map[plan.support_level])
+
+    if plan.custom_sla:
+        features.append("Custom SLA")
+
+    return {
+        "id":           plan.id,
+        "name":         plan.name.capitalize(),
+        # Price display
+        "price_omr":    float(plan.price_omr) if plan.price_omr else None,
+        "price_label":  f"OMR {int(plan.price_omr)}/mo" if plan.price_omr else "Contact us/mo",
+        # Credits display
+        "credits":      plan.credits if plan.credits else None,
+        "credits_label": f"{plan.credits} credits" if plan.credits else "Unlimited",
+        # Feature bullets
+        "features":     features,
+        # Card state
+        "is_current":   is_current,
+        "is_best_value": plan.name == SubscriptionPlan.PLAN_BUSINESS,
+        # CTA button
+        "cta_label":    "Current Plan" if is_current else "Upgrade →",
+        "cta_disabled": is_current,
+    }
+
+
+def _serialize_transaction(txn):
+    """
+    Matches the Credit Transaction History rows:
+    icon colour: green circle for credit (+), red circle for debit (-)
+    """
+    sign     = "+" if txn.delta >= 0 else ""
+    is_credit = txn.delta > 0
+
+    return {
+        "id":          txn.id,
+        "delta":       txn.delta,
+        "delta_label": f"{sign}{txn.delta}",
+        "is_credit":   is_credit,
+        # icon hint for frontend: "plus" | "minus"
+        "icon_type":   "plus" if is_credit else "minus",
+        "reason":      txn.get_reason_display(),
+        "note":        txn.note,
+        "date_label":  txn.created_at.strftime("%d %b %Y").lstrip("0"),
+        "created_at":  txn.created_at.isoformat(),
+        # booking link if applicable
+        "booking_id":  txn.booking_id,
+    }
+
+# ---------------------------------------------------------------------------
+# GET /api/professionals/vendor/credits/
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# GET /api/professionals/vendor/credits/
+# ---------------------------------------------------------------------------
+
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_credits(request):
+    """
+    Returns everything the Credits & Plans screen needs, all derived
+    from the logged-in vendor's VendorSubscription row.
+
+    credit_summary  → the dark banner at top (balance, usage bar, plan label)
+    plans           → 4 plan cards (is_current driven by sub.plan)
+    transactions    → Credit Transaction History list (paginated)
+    """
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response(
+            {"status": "error", "message": "Professional profile not found."},
+            status=404,
+        )
+
+    # ── Subscription row (auto-create on Starter if vendor has none) ───────
+    try:
+        sub = professional.subscription
+    except VendorSubscription.DoesNotExist:
+        starter = SubscriptionPlan.objects.filter(
+            name=SubscriptionPlan.PLAN_STARTER, is_active=True
+        ).first()
+        if not starter:
+            return Response(
+                {"status": "error", "message": "No subscription plans configured yet."},
+                status=500,
+            )
+        from django.utils.timezone import now
+        from dateutil.relativedelta import relativedelta
+        sub = VendorSubscription.objects.create(
+            professional=professional,
+            plan=starter,
+            credits=starter.credits,
+            credits_used=0,
+            renews_at=(now() + relativedelta(months=1)).date(),
+        )
+
+    # ── Credit summary (dark banner) ────────────────────────────────────────
+    balance      = sub.credits          # e.g. 240
+    used         = sub.credits_used     # e.g. 90
+    total_issued = balance + used       # 330  (used for progress bar denominator)
+    usage_pct    = round(used / total_issued * 100) if total_issued else 0
+
+    renews_label = ""
+    if sub.renews_at:
+        renews_label = (
+            f"{sub.plan.name.capitalize()} Plan · "
+            f"Renews {sub.renews_at.strftime('%d %b %Y').lstrip('0')}"
+        )
+
+    credit_summary = {
+        "balance":          balance,
+        "used_this_month":  used,
+        "remaining":        balance,
+        "total_issued":     total_issued,
+        "usage_pct":        usage_pct,
+        "usage_label":      f"{used} used · {balance} remaining",
+        "plan_name":        sub.plan.name.capitalize(),
+        "renews_at":        sub.renews_at.strftime("%d %b %Y").lstrip("0") if sub.renews_at else None,
+        "renews_label":     renews_label,
+    }
+
+    # ── Plan cards ──────────────────────────────────────────────────────────
+    plans = SubscriptionPlan.objects.filter(is_active=True).order_by("price_omr")
+    plan_cards = [_serialize_plan(p, sub.plan_id) for p in plans]
+
+    # ── Transaction history (paginated) ─────────────────────────────────────
+    txn_qs      = CreditTransaction.objects.filter(professional=professional)
+    page_number = int(request.GET.get("page", 1))
+    page_size   = int(request.GET.get("page_size", 20))
+    paginator   = Paginator(txn_qs, page_size)
+    page_obj    = paginator.get_page(page_number)
+
+    def _page_url(num):
+        if not num:
+            return None
+        p = request.GET.copy()
+        p["page"]      = num
+        p["page_size"] = page_size
+        return f"{request.path}?{p.urlencode()}"
+
+    return Response({
+        "status":         "success",
+        "credit_summary": credit_summary,
+        "plans":          plan_cards,
+        "transactions": {
+            "count":        len(page_obj.object_list),
+            "total_count":  paginator.count,
+            "total_pages":  paginator.num_pages,
+            "current_page": page_obj.number,
+            "next":         _page_url(page_obj.next_page_number() if page_obj.has_next() else None),
+            "previous":     _page_url(page_obj.previous_page_number() if page_obj.has_previous() else None),
+            "data":         [_serialize_transaction(t) for t in page_obj],
+        },
+    })
+
+# ---------------------------------------------------------------------------
+# POST /api/professionals/vendor/credits/upgrade/
+# Body: { "plan_id": 2 }
+# ---------------------------------------------------------------------------
+
+@api_view(["POST"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_upgrade_plan(request):
+    """
+    Upgrades (or downgrades) the vendor's subscription plan.
+    In production this would trigger a payment gateway call first.
+    """
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    plan_id = request.data.get("plan_id")
+    if not plan_id:
+        return Response({"status": "error", "message": "plan_id is required."}, status=400)
+
+    try:
+        new_plan = SubscriptionPlan.objects.get(id=plan_id, is_active=True)
+    except SubscriptionPlan.DoesNotExist:
+        return Response({"status": "error", "message": "Plan not found."}, status=404)
+
+    # Custom plan → just flag for sales team
+    if new_plan.name == SubscriptionPlan.PLAN_CUSTOM:
+        return Response({
+            "status":  "success",
+            "message": "Our team will contact you shortly to set up a Custom plan.",
+        })
+
+    # Upsert subscription
+    from django.utils.timezone import now
+    from dateutil.relativedelta import relativedelta  # pip install python-dateutil if not present
+
+    next_renewal = (now() + relativedelta(months=1)).date()
+
+    sub, created = VendorSubscription.objects.get_or_create(
+        professional=professional,
+        defaults={"plan": new_plan, "credits": new_plan.credits, "renews_at": next_renewal},
+    )
+    if not created:
+        old_plan = sub.plan
+        sub.plan      = new_plan
+        sub.credits   = sub.credits + new_plan.credits   # add new plan credits on top
+        sub.credits_used = 0                              # reset cycle usage
+        sub.renews_at = next_renewal
+        sub.save()
+
+        # Log the credit top-up
+        CreditTransaction.objects.create(
+            professional=professional,
+            delta=new_plan.credits,
+            reason=CreditTransaction.REASON_PLAN_RENEWAL,
+            note=f"Plan upgrade to {new_plan.name.capitalize()} — {new_plan.credits} credits added",
+        )
+
+    return Response({
+        "status":  "success",
+        "message": f"Upgraded to {new_plan.name.capitalize()} plan. {new_plan.credits} credits added.",
+        "data": {
+            "plan_name":    new_plan.name.capitalize(),
+            "credits":      sub.credits,
+            "renews_at":    sub.renews_at.strftime("%d %b %Y").lstrip("0"),
+        },
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /api/professionals/vendor/credits/deduct/   (internal / admin use)
+# Body: { "professional_id": 5, "delta": -1, "reason": "booking_lead",
+#         "note": "AC Deep Cleaning dispatched #UO-4601", "booking_id": 123 }
+# Call this when admin dispatches a booking to a vendor (costs 1 credit).
+# ---------------------------------------------------------------------------
+
+@api_view(["POST"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_adjust_credits(request):
+    """
+    Admin manually adds or deducts credits for a vendor.
+    Also used internally when a booking lead is dispatched (delta = -1).
+    """
+    professional_id = request.data.get("professional_id")
+    delta           = request.data.get("delta")
+    reason          = request.data.get("reason", CreditTransaction.REASON_ADMIN_BONUS)
+    note            = request.data.get("note", "")
+    booking_id      = request.data.get("booking_id")
+
+    if professional_id is None or delta is None:
+        return Response({"status": "error", "message": "professional_id and delta are required."}, status=400)
+
+    try:
+        professional = Professional.objects.get(pk=professional_id, is_active=True)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional not found."}, status=404)
+
+    try:
+        sub = professional.subscription
+    except VendorSubscription.DoesNotExist:
+        return Response({"status": "error", "message": "Vendor has no subscription."}, status=400)
+
+    delta = int(delta)
+
+    # Prevent over-deduction
+    if delta < 0 and sub.credits + delta < 0:
+        return Response({
+            "status":  "error",
+            "message": f"Insufficient credits. Balance: {sub.credits}, attempted deduction: {abs(delta)}.",
+        }, status=400)
+
+    sub.credits += delta
+    if delta < 0:
+        sub.credits_used += abs(delta)
+    sub.save(update_fields=["credits", "credits_used", "updated_at"])
+
+    booking = None
+    if booking_id:
+        try:
+            booking = Booking.objects.get(pk=booking_id)
+        except Booking.DoesNotExist:
+            pass
+
+    CreditTransaction.objects.create(
+        professional=professional,
+        delta=delta,
+        reason=reason,
+        note=note,
+        booking=booking,
+    )
+
+    return Response({
+        "status":  "success",
+        "message": f"Credits adjusted by {delta:+d}. New balance: {sub.credits}.",
+        "data": {
+            "professional_id": professional.id,
+            "delta":           delta,
+            "new_balance":     sub.credits,
+            "credits_used":    sub.credits_used,
+        },
+    })

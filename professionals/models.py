@@ -333,4 +333,98 @@ class PayoutRequest(models.Model):
  
     def __str__(self):
         return f"{self.professional.name} — {self.month_start.strftime('%b %Y')} — OMR {self.net_amount} [{self.status}]"
- 
+
+
+
+ # ── Credits & Plans ──────────────────────────────────────────────────────────
+
+class SubscriptionPlan(models.Model):
+    PLAN_STARTER      = "starter"
+    PLAN_PROFESSIONAL = "professional"
+    PLAN_BUSINESS     = "business"
+    PLAN_CUSTOM       = "custom"
+    PLAN_CHOICES = [
+        (PLAN_STARTER,      "Starter"),
+        (PLAN_PROFESSIONAL, "Professional"),
+        (PLAN_BUSINESS,     "Business"),
+        (PLAN_CUSTOM,       "Custom"),
+    ]
+
+    name          = models.CharField(max_length=50, choices=PLAN_CHOICES, unique=True)
+    price_omr     = models.DecimalField(max_digits=8, decimal_places=2)
+    credits       = models.PositiveIntegerField()           # 0 = unlimited
+    leads_per_mo  = models.PositiveIntegerField(default=0) # 0 = unlimited
+    dispatch_priority = models.CharField(max_length=30, default="standard")
+    ai_job_matching   = models.BooleanField(default=False)
+    support_level     = models.CharField(max_length=30, default="email")
+    dedicated_manager = models.BooleanField(default=False)
+    custom_sla        = models.BooleanField(default=False)
+    is_active         = models.BooleanField(default=True)
+
+    def __str__(self):
+        return self.name
+
+
+class VendorSubscription(models.Model):
+    """The active subscription for a professional."""
+    professional = models.OneToOneField(
+        Professional, on_delete=models.CASCADE, related_name="subscription"
+    )
+    plan          = models.ForeignKey(SubscriptionPlan, on_delete=models.PROTECT)
+    credits       = models.IntegerField(default=0)          # current balance
+    credits_used  = models.IntegerField(default=0)          # used this billing cycle
+    renews_at     = models.DateField(null=True, blank=True)
+    started_at    = models.DateTimeField(auto_now_add=True)
+    updated_at    = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.professional.name} — {self.plan.name} ({self.credits} credits)"
+
+
+class CreditTransaction(models.Model):
+    REASON_PLAN_RENEWAL   = "plan_renewal"
+    REASON_BOOKING_LEAD   = "booking_lead"
+    REASON_ADMIN_BONUS    = "admin_bonus"
+    REASON_MANUAL_TOPUP   = "manual_topup"
+    REASON_REFUND         = "refund"
+    REASON_CHOICES = [
+        (REASON_PLAN_RENEWAL, "Plan Renewal"),
+        (REASON_BOOKING_LEAD, "Booking Lead"),
+        (REASON_ADMIN_BONUS,  "Admin Bonus"),
+        (REASON_MANUAL_TOPUP, "Manual Top-up"),
+        (REASON_REFUND,       "Refund"),
+    ]
+
+    professional = models.ForeignKey(
+        Professional, on_delete=models.CASCADE, related_name="credit_transactions"
+    )
+    delta        = models.IntegerField()            # +150 or -1
+    reason       = models.CharField(max_length=30, choices=REASON_CHOICES)
+    note         = models.CharField(max_length=200, blank=True)   # "AC Deep Cleaning dispatched #UO-4601"
+    booking      = models.ForeignKey(
+        Booking, on_delete=models.SET_NULL, null=True, blank=True
+    )
+    created_at   = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        sign = "+" if self.delta >= 0 else ""
+        return f"{self.professional.name} {sign}{self.delta} ({self.reason})"
+
+
+# ── Live Map ─────────────────────────────────────────────────────────────────
+
+class VendorLocation(models.Model):
+    """Latest GPS ping from the vendor's mobile app."""
+    professional = models.OneToOneField(
+        Professional, on_delete=models.CASCADE, related_name="location"
+    )
+    latitude     = models.DecimalField(max_digits=9, decimal_places=6)
+    longitude    = models.DecimalField(max_digits=9, decimal_places=6)
+    area_label   = models.CharField(max_length=100, blank=True)   # "Al Khuwair · Muscat"
+    updated_at   = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.professional.name} @ ({self.latitude}, {self.longitude})"

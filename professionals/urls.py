@@ -48,6 +48,14 @@ from .views import (
     admin_refunds,
     admin_payments_export,
 )
+from .views import (
+    vendor_live_map,
+    vendor_update_location,
+    vendor_credits,
+    vendor_upgrade_plan,
+    admin_adjust_credits,
+)
+
  
 
 urlpatterns = [
@@ -179,5 +187,18 @@ urlpatterns = [
     path("admin/payments/platform-revenue/", admin_platform_revenue, name="admin_platform_revenue"),
     path("admin/payments/refunds/", admin_refunds, name="admin_refunds"),
     path("admin/payments/export/", admin_payments_export, name="admin_payments_export"),
+    # ── Live Map ──────────────────────────────────────────────────────────────────
+# GET  /api/professionals/vendor/live-map/
+path("vendor/live-map/",    vendor_live_map,         name="vendor_live_map"),
+# PATCH /api/professionals/vendor/location/
+path("vendor/location/",    vendor_update_location,  name="vendor_update_location"),
+
+# ── Credits & Plans ───────────────────────────────────────────────────────────
+# GET  /api/professionals/vendor/credits/
+path("vendor/credits/",             vendor_credits,       name="vendor_credits"),
+# POST /api/professionals/vendor/credits/upgrade/
+path("vendor/credits/upgrade/",     vendor_upgrade_plan,  name="vendor_upgrade_plan"),
+# POST /api/professionals/admin/credits/adjust/
+path("admin/credits/adjust/",       admin_adjust_credits, name="admin_adjust_credits"),
 
 ]
