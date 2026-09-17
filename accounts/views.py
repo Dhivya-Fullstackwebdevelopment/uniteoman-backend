@@ -518,45 +518,68 @@ def _get_or_create_profile(user):
 @authentication_classes([JWTAuthentication])
 @permission_classes([IsAuthenticated])
 def account_overview(request):
+
     user = request.user
     profile = _get_or_create_profile(user)
 
     bookings_qs = Booking.objects.filter(user_email=user.email)
+
     total_bookings = bookings_qs.count()
 
     total_spent = bookings_qs.filter(
         status=Booking.STATUS_COMPLETED
-    ).aggregate(s=Sum("total_amount"))["s"] or 0
+    ).aggregate(
+        s=Sum("total_amount")
+    )["s"] or 0
 
     avg_rating = Review.objects.filter(
-        reviewer_name=user.get_full_name() if hasattr(user, "get_full_name") else user.email
-    ).aggregate(avg=Avg("rating"))["avg"]
+        reviewer_name=user.name
+    ).aggregate(
+        avg=Avg("rating")
+    )["avg"]
 
     addresses = SavedAddress.objects.filter(user=user)
     cards = SavedCard.objects.filter(user=user)
 
     return Response({
         "status": "success",
+
         "data": {
-            "avatar": request.build_absolute_uri(profile.avatar.url) if profile.avatar else "",
-            "full_name": getattr(user, "get_full_name", lambda: "")() or getattr(user, "name", "") or "",
+
+            "avatar": (
+                request.build_absolute_uri(profile.avatar.url)
+                if profile.avatar
+                else ""
+            ),
+
+            # From accounts_user.name
+            "full_name": user.name,
+
+            # From accounts_user.email
             "email": user.email,
+
+            # From accounts_user.mobile_number
             "phone": user.mobile_number,
+
             "stats": {
                 "bookings_total": total_bookings,
                 "avg_rating": round(avg_rating, 1) if avg_rating else None,
                 "total_spent": float(total_spent),
                 "currency": "OMR",
             },
+
             "personal_info": {
-                "full_name": getattr(user, "get_full_name", lambda: "")() or "",
+                "full_name": user.name,
                 "phone": user.mobile_number,
                 "email": user.email,
                 "language": profile.language,
                 "preferred_area": profile.preferred_area,
-                "notification_preference": profile.get_notification_preference_display(),
+                "notification_preference":
+                    profile.get_notification_preference_display(),
             },
+
             "saved_addresses_count": addresses.count(),
+
             "saved_addresses": [
                 {
                     "id": a.id,
@@ -564,12 +587,15 @@ def account_overview(request):
                     "area": a.area,
                     "villa_apartment_no": a.villa_apartment_no,
                     "street_name": a.street_name,
+                    "building_floor": a.building_floor,
+                    "nearest_landmark": a.nearest_landmark,
                     "is_default": a.is_default,
                 }
                 for a in addresses
             ],
+
             "payment_methods_count": cards.count(),
-        },
+        }
     })
 
 
@@ -587,19 +613,14 @@ def update_profile(request):
 
     # Update full name
     if "full_name" in payload:
-        full_name = str(payload["full_name"]).strip()
-
-        parts = full_name.split(" ", 1)
-
-        user.first_name = parts[0]
-        user.last_name = parts[1] if len(parts) > 1 else ""
+        user.name = str(payload["full_name"]).strip()
 
     # Update phone number
     if "phone" in payload:
         phone = str(payload["phone"]).strip()
 
-        if phone:
-            user.mobile_number = phone
+    if phone:
+        user.mobile_number = phone
 
     # Save User changes
     user.save()
