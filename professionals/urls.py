@@ -56,7 +56,15 @@ from .views import (
     admin_adjust_credits,
 )
 
- 
+from .views import (
+    vendor_settings_view,
+    vendor_settings_update_profile,
+    vendor_settings_update_availability,
+    vendor_toggle_online_status,
+    vendor_settings_update_notifications,
+)
+from .views import platform_config_view, toggle_payment_gateway, toggle_integration
+
 
 urlpatterns = [
     # Professional List + Filters
@@ -201,4 +209,15 @@ path("vendor/credits/upgrade/",     vendor_upgrade_plan,  name="vendor_upgrade_p
 # POST /api/professionals/admin/credits/adjust/
 path("admin/credits/adjust/",       admin_adjust_credits, name="admin_adjust_credits"),
 
+
+    path("vendor/settings/", vendor_settings_view, name="vendor_settings_view"),
+    path("vendor/settings/profile/", vendor_settings_update_profile, name="vendor_settings_update_profile"),
+    path("vendor/settings/availability/", vendor_settings_update_availability, name="vendor_settings_update_availability"),
+    path("vendor/settings/online-status/", vendor_toggle_online_status, name="vendor_toggle_online_status"),
+    path("vendor/settings/notifications/", vendor_settings_update_notifications, name="vendor_settings_update_notifications"),
+
+    path("payment-gateways/<int:pk>/", toggle_payment_gateway, name="toggle_payment_gateway"),
+    path("integrations/<int:pk>/", toggle_integration, name="toggle_integration"),
 ]
+
+

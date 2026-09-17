@@ -15,6 +15,16 @@ from .serializers import (
 from professionals.models import Professional
 from django.contrib.auth.hashers import check_password, make_password
 
+from django.db.models import Avg, Sum, Count
+from django.shortcuts import get_object_or_404
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.permissions import IsAuthenticated
+from rest_framework_simplejwt.authentication import JWTAuthentication
+
+from .models import UserProfile, SavedAddress, SavedCard
+from professionals.models import Booking, Review
+
+
 # ============ OTP ENDPOINTS ============
 
 @api_view(['POST'])
@@ -494,3 +504,214 @@ def login_with_role(request):
     return Response({
         'error': 'Invalid credentials or user not found'
     }, status=status.HTTP_401_UNAUTHORIZED)
+
+
+def _get_or_create_profile(user):
+    profile, _ = UserProfile.objects.get_or_create(user=user)
+    return profile
+
+
+# ---------------------------------------------------------------------------
+# GET /api/auth/account/overview/
+# ---------------------------------------------------------------------------
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def account_overview(request):
+    user = request.user
+    profile = _get_or_create_profile(user)
+
+    bookings_qs = Booking.objects.filter(user_email=user.email)
+    total_bookings = bookings_qs.count()
+
+    total_spent = bookings_qs.filter(
+        status=Booking.STATUS_COMPLETED
+    ).aggregate(s=Sum("total_amount"))["s"] or 0
+
+    avg_rating = Review.objects.filter(
+        reviewer_name=user.get_full_name() if hasattr(user, "get_full_name") else user.email
+    ).aggregate(avg=Avg("rating"))["avg"]
+
+    addresses = SavedAddress.objects.filter(user=user)
+    cards = SavedCard.objects.filter(user=user)
+
+    return Response({
+        "status": "success",
+        "data": {
+            "avatar": request.build_absolute_uri(profile.avatar.url) if profile.avatar else "",
+            "full_name": getattr(user, "get_full_name", lambda: "")() or getattr(user, "name", "") or "",
+            "email": user.email,
+            "phone": user.mobile_number,
+            "stats": {
+                "bookings_total": total_bookings,
+                "avg_rating": round(avg_rating, 1) if avg_rating else None,
+                "total_spent": float(total_spent),
+                "currency": "OMR",
+            },
+            "personal_info": {
+                "full_name": getattr(user, "get_full_name", lambda: "")() or "",
+                "phone": user.mobile_number,
+                "email": user.email,
+                "language": profile.language,
+                "preferred_area": profile.preferred_area,
+                "notification_preference": profile.get_notification_preference_display(),
+            },
+            "saved_addresses_count": addresses.count(),
+            "saved_addresses": [
+                {
+                    "id": a.id,
+                    "label": a.label,
+                    "area": a.area,
+                    "villa_apartment_no": a.villa_apartment_no,
+                    "street_name": a.street_name,
+                    "is_default": a.is_default,
+                }
+                for a in addresses
+            ],
+            "payment_methods_count": cards.count(),
+        },
+    })
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/auth/account/profile/
+# Body: { "full_name", "phone", "language", "preferred_area", "notification_preference" }
+# ---------------------------------------------------------------------------
+@api_view(['PATCH'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def update_profile(request):
+    user = request.user
+    profile = _get_or_create_profile(user)
+    payload = request.data
+
+    # Update full name
+    if "full_name" in payload:
+        full_name = str(payload["full_name"]).strip()
+
+        parts = full_name.split(" ", 1)
+
+        user.first_name = parts[0]
+        user.last_name = parts[1] if len(parts) > 1 else ""
+
+    # Update phone number
+    if "phone" in payload:
+        phone = str(payload["phone"]).strip()
+
+        if phone:
+            user.mobile_number = phone
+
+    # Save User changes
+    user.save()
+
+    # Update language
+    if "language" in payload:
+        profile.language = payload["language"]
+
+    # Update preferred area
+    if "preferred_area" in payload:
+        profile.preferred_area = payload["preferred_area"]
+
+    # Update notification preference
+    if "notification_preference" in payload:
+
+        notification_map = {
+            "SMS + Push + WhatsApp": "sms_push_whatsapp",
+            "SMS + Push": "sms_push",
+            "Push Only": "push_only",
+            "None": "none",
+        }
+
+        notification_value = payload["notification_preference"]
+
+        profile.notification_preference = notification_map.get(
+            notification_value,
+            notification_value
+        )
+
+    # Save UserProfile changes
+    profile.save()
+
+    return Response({
+        "status": "success",
+        "message": "Profile updated successfully.",
+        "data": {
+            "full_name": f"{user.first_name} {user.last_name}".strip(),
+            "phone": user.mobile_number,
+            "email": user.email,
+            "language": profile.language,
+            "preferred_area": profile.preferred_area,
+            "notification_preference": profile.notification_preference,
+            "notification_preference_display": profile.get_notification_preference_display(),
+        }
+    }, status=status.HTTP_200_OK)
+
+# ---------------------------------------------------------------------------
+# Saved Addresses: GET list / POST add / PATCH edit / DELETE remove
+# ---------------------------------------------------------------------------
+@api_view(['GET', 'POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def saved_addresses(request):
+    if request.method == 'GET':
+        addresses = SavedAddress.objects.filter(user=request.user)
+        return Response({
+            "status": "success",
+            "count": addresses.count(),
+            "data": [
+                {
+                    "id": a.id, "label": a.label, "area": a.area,
+                    "villa_apartment_no": a.villa_apartment_no,
+                    "street_name": a.street_name,
+                    "building_floor": a.building_floor,
+                    "nearest_landmark": a.nearest_landmark,
+                    "is_default": a.is_default,
+                }
+                for a in addresses
+            ],
+        })
+
+    payload = request.data
+    required = ["area", "villa_apartment_no", "street_name"]
+    missing = [f for f in required if not payload.get(f)]
+    if missing:
+        return Response({
+            "status": "error",
+            "message": f"Missing required fields: {', '.join(missing)}",
+        }, status=400)
+
+    if payload.get("is_default"):
+        SavedAddress.objects.filter(user=request.user).update(is_default=False)
+
+    address = SavedAddress.objects.create(
+        user=request.user,
+        label=payload.get("label", ""),
+        area=payload["area"],
+        villa_apartment_no=payload["villa_apartment_no"],
+        street_name=payload["street_name"],
+        building_floor=payload.get("building_floor", ""),
+        nearest_landmark=payload.get("nearest_landmark", ""),
+        is_default=bool(payload.get("is_default", False)),
+    )
+    return Response({"status": "success", "message": "Address added.", "data": {"id": address.id}}, status=201)
+
+
+@api_view(['PATCH', 'DELETE'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def saved_address_detail(request, pk):
+    address = get_object_or_404(SavedAddress, pk=pk, user=request.user)
+
+    if request.method == 'DELETE':
+        address.delete()
+        return Response({"status": "success", "message": "Address removed."})
+
+    payload = request.data
+    for field in ["label", "area", "villa_apartment_no", "street_name", "building_floor", "nearest_landmark"]:
+        if field in payload:
+            setattr(address, field, payload[field])
+    if payload.get("is_default"):
+        SavedAddress.objects.filter(user=request.user).update(is_default=False)
+        address.is_default = True
+    address.save()
+    return Response({"status": "success", "message": "Address updated."})

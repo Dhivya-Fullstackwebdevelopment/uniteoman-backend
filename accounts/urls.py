@@ -1,6 +1,7 @@
 from django.urls import path
 from . import views
 
+
 urlpatterns = [
     # OTP endpoints
     path('otp/send/', views.send_otp, name='send_otp'),
@@ -23,4 +24,9 @@ urlpatterns = [
     # Password reset
     path('password/forgot/', views.forgot_password, name='forgot_password'),
     path('password/reset/', views.reset_password, name='reset_password'),
+
+    path("account/overview/",  views.account_overview, name="account_overview"),
+    path("account/profile/",  views.update_profile, name="update_profile"),
+    path("account/addresses/",  views.saved_addresses, name="saved_addresses"),
+    path("account/addresses/<int:pk>/",  views.saved_address_detail, name="saved_address_detail"),
 ]

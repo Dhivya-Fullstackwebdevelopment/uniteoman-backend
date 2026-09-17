@@ -428,3 +428,120 @@ class VendorLocation(models.Model):
 
     def __str__(self):
         return f"{self.professional.name} @ ({self.latitude}, {self.longitude})"
+
+
+class VendorSettings(models.Model):
+    TYPE_CHOICES = [
+        ("llc", "LLC Company"),
+        ("sole_proprietor", "Sole Proprietor"),
+        ("individual", "Individual"),
+    ]
+
+    professional = models.OneToOneField(
+        Professional, on_delete=models.CASCADE, related_name="settings"
+    )
+    company_name = models.CharField(max_length=150, blank=True)
+    owner_name = models.CharField(max_length=150, blank=True)
+    cr_number = models.CharField(max_length=50, blank=True)
+    cr_verified = models.BooleanField(default=False)
+    oman_id_status = models.CharField(max_length=50, blank=True)  # "Verified (ROP)"
+    oman_id_verified = models.BooleanField(default=False)
+    business_type = models.CharField(max_length=30, choices=TYPE_CHOICES, default="llc")
+
+    working_hours_start = models.TimeField(null=True, blank=True)
+    working_hours_end = models.TimeField(null=True, blank=True)
+    working_days = models.CharField(max_length=50, blank=True)  # "Sat-Thu"
+    max_jobs_per_day = models.PositiveIntegerField(default=4)
+    emergency_callouts_enabled = models.BooleanField(default=False)
+    emergency_callout_fee = models.DecimalField(max_digits=8, decimal_places=2, default=0)
+
+    is_online = models.BooleanField(default=True)
+
+    notify_new_booking = models.BooleanField(default=True)
+    notify_payment_received = models.BooleanField(default=True)
+    notify_review_posted = models.BooleanField(default=True)
+    notify_credits_low = models.BooleanField(default=True)
+    notify_weekly_earnings = models.BooleanField(default=True)
+    notify_ai_tips = models.BooleanField(default=True)
+
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Settings for {self.professional.name}"
+
+
+class PlatformConfig(models.Model):
+    """Singleton row holding global platform config."""
+    platform_commission_pct = models.DecimalField(max_digits=5, decimal_places=2, default=15.00)
+    vat_rate_pct = models.DecimalField(max_digits=5, decimal_places=2, default=9.00)
+    payout_cycle = models.CharField(max_length=10, default="T+1")
+    currency = models.CharField(max_length=10, default="OMR")
+    currency_decimals = models.PositiveSmallIntegerField(default=3)
+    default_languages = models.CharField(max_length=50, default="EN + AR")
+    auto_routing_ai_enabled = models.BooleanField(default=True)
+    ai_moderation_enabled = models.BooleanField(default=True)
+    max_jobs_per_vendor_per_day = models.PositiveIntegerField(default=8)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Platform Configuration"
+        verbose_name_plural = "Platform Configuration"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1  # enforce singleton
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def get_solo(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+    def __str__(self):
+        return "Platform Configuration"
+
+
+class PaymentGateway(models.Model):
+    STATUS_LIVE = "live"
+    STATUS_SETUP = "setup"
+    STATUS_DISABLED = "disabled"
+    STATUS_CHOICES = [
+        (STATUS_LIVE, "Live"),
+        (STATUS_SETUP, "Setup"),
+        (STATUS_DISABLED, "Disabled"),
+    ]
+
+    name = models.CharField(max_length=100)          # "Bank of Muscat"
+    description = models.CharField(max_length=150, blank=True)  # "OMR cards · Maisarah · Primary"
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_SETUP)
+    is_primary = models.BooleanField(default=False)
+    sort_order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["sort_order", "name"]
+
+    def __str__(self):
+        return self.name
+
+
+class Integration(models.Model):
+    STATUS_LIVE = "live"
+    STATUS_SETUP = "setup"
+    STATUS_CONNECTED = "connected"
+    STATUS_DISABLED = "disabled"
+    STATUS_CHOICES = [
+        (STATUS_LIVE, "Live"),
+        (STATUS_SETUP, "Setup"),
+        (STATUS_CONNECTED, "Connected"),
+        (STATUS_DISABLED, "Disabled"),
+    ]
+
+    name = models.CharField(max_length=100)          # "Unifonic SMS"
+    description = models.CharField(max_length=150, blank=True)  # "OTP · Booking SMS · EN+AR"
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_SETUP)
+    sort_order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["sort_order", "name"]
+
+    def __str__(self):
+        return self.name

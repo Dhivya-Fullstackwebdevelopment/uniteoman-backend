@@ -3,6 +3,8 @@ from django.contrib.auth.models import AbstractUser, BaseUserManager
 from django.utils import timezone
 import random
 import string
+from django.conf import settings
+
 
 class UserManager(BaseUserManager):
     def create_user(self, mobile_number, password=None, **extra_fields):
@@ -109,3 +111,61 @@ class AdminLogin(models.Model):
         from django.contrib.auth.hashers import make_password
         self.password = make_password(raw_password)
         self.save()
+
+class UserProfile(models.Model):
+    """Extra profile fields not on the core User model."""
+    LANGUAGE_CHOICES = [("en", "English"), ("ar", "Arabic")]
+    NOTIFICATION_CHOICES = [
+        ("sms_push_whatsapp", "SMS + Push + WhatsApp"),
+        ("sms_push", "SMS + Push"),
+        ("push_only", "Push Only"),
+        ("none", "None"),
+    ]
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="profile"
+    )
+    preferred_area = models.CharField(max_length=100, blank=True)
+    language = models.CharField(max_length=5, choices=LANGUAGE_CHOICES, default="en")
+    notification_preference = models.CharField(
+        max_length=30, choices=NOTIFICATION_CHOICES, default="sms_push_whatsapp"
+    )
+    avatar = models.ImageField(upload_to="user_avatars", blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Profile for {self.user}"
+
+
+class SavedAddress(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="saved_addresses"
+    )
+    label = models.CharField(max_length=50, blank=True)  # "Home", "Work"
+    area = models.CharField(max_length=100)
+    villa_apartment_no = models.CharField(max_length=100)
+    street_name = models.CharField(max_length=150)
+    building_floor = models.CharField(max_length=100, blank=True)
+    nearest_landmark = models.CharField(max_length=150, blank=True)
+    is_default = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-is_default", "-created_at"]
+
+    def __str__(self):
+        return f"{self.label or self.area} — {self.user}"
+
+
+class SavedCard(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="saved_cards"
+    )
+    card_brand = models.CharField(max_length=30, blank=True)  # "Visa", "Mastercard"
+    last4 = models.CharField(max_length=4)
+    is_default = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-is_default", "-created_at"]

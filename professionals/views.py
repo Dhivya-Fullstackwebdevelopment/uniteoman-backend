@@ -17,6 +17,10 @@ from django.db import transaction
 from django.utils.timezone import make_aware, is_naive
 from django.contrib.auth import get_user_model
 
+from rest_framework.permissions import IsAuthenticated
+
+from .models import Professional, VendorSettings, ProfessionalArea
+
 import csv
 from django.http import HttpResponse
 from django.db.models import Q
@@ -51,6 +55,8 @@ from decimal import Decimal, ROUND_DOWN
 from .models import (
     VendorSubscription, SubscriptionPlan, CreditTransaction, VendorLocation
 )
+from .models import PlatformConfig, PaymentGateway, Integration
+
 
 User = get_user_model()
 
@@ -4904,4 +4910,333 @@ def admin_adjust_credits(request):
             "new_balance":     sub.credits,
             "credits_used":    sub.credits_used,
         },
+    })
+
+
+def _get_or_create_settings(professional):
+    settings_obj, _ = VendorSettings.objects.get_or_create(professional=professional)
+    return settings_obj
+
+
+def _serialize_settings(pro, settings_obj):
+    areas = list(ProfessionalArea.objects.filter(professional=pro).values_list("area", flat=True))
+    return {
+        "profile": {
+            "company_name": settings_obj.company_name,
+            "owner": settings_obj.owner_name or pro.name,
+            "phone": pro.phone,
+            "email": pro.email,
+            "cr_number": settings_obj.cr_number,
+            "cr_verified": settings_obj.cr_verified,
+            "oman_id": settings_obj.oman_id_status,
+            "oman_id_verified": settings_obj.oman_id_verified,
+            "type": settings_obj.get_business_type_display(),
+        },
+        "availability": {
+            "working_hours": (
+                f"{settings_obj.working_hours_start.strftime('%I:%M %p').lstrip('0')} – "
+                f"{settings_obj.working_hours_end.strftime('%I:%M %p').lstrip('0')}"
+                if settings_obj.working_hours_start and settings_obj.working_hours_end else None
+            ),
+            "working_hours_start": settings_obj.working_hours_start.strftime("%H:%M") if settings_obj.working_hours_start else None,
+            "working_hours_end": settings_obj.working_hours_end.strftime("%H:%M") if settings_obj.working_hours_end else None,
+            "working_days": settings_obj.working_days,
+            "areas_served": ", ".join(areas),
+            "max_jobs_per_day": settings_obj.max_jobs_per_day,
+            "emergency_callouts": {
+                "enabled": settings_obj.emergency_callouts_enabled,
+                "fee": float(settings_obj.emergency_callout_fee),
+                "label": f"Yes (+OMR {settings_obj.emergency_callout_fee})" if settings_obj.emergency_callouts_enabled else "No",
+            },
+            "online_status": "online" if settings_obj.is_online else "offline",
+        },
+        "notifications": {
+            "new_booking_alert": settings_obj.notify_new_booking,
+            "payment_received": settings_obj.notify_payment_received,
+            "review_posted": settings_obj.notify_review_posted,
+            "credits_low_warning": settings_obj.notify_credits_low,
+            "weekly_earnings": settings_obj.notify_weekly_earnings,
+            "ai_tips": settings_obj.notify_ai_tips,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/professionals/vendor/settings/
+# ---------------------------------------------------------------------------
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_settings_view(request):
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    settings_obj = _get_or_create_settings(professional)
+
+    # Bank account (from payments module)
+    from .models import VendorBankAccount
+    bank = VendorBankAccount.objects.filter(professional=professional, is_primary=True).first()
+    bank_data = None
+    if bank:
+        bank_data = {
+            "bank_name": bank.bank_name,
+            "iban": bank.iban,
+            "is_verified": bank.is_verified,
+            "is_primary": bank.is_primary,
+        }
+
+    data = _serialize_settings(professional, settings_obj)
+    data["bank_account"] = bank_data
+
+    return Response({"status": "success", "data": data})
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/professionals/vendor/settings/profile/
+# ---------------------------------------------------------------------------
+@api_view(['PATCH'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_settings_update_profile(request):
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    settings_obj = _get_or_create_settings(professional)
+    payload = request.data
+
+    for field in ["company_name", "owner_name", "cr_number", "business_type"]:
+        if field in payload:
+            setattr(settings_obj, field, payload[field])
+    settings_obj.save()
+
+    for field in ["phone", "email"]:
+        if field in payload:
+            setattr(professional, field, payload[field])
+    professional.save(update_fields=["phone", "email"])
+
+    return Response({"status": "success", "message": "Vendor profile updated."})
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/professionals/vendor/settings/availability/
+# Body: { "working_hours_start": "08:00", "working_hours_end": "19:00",
+#         "working_days": "Sat-Thu", "max_jobs_per_day": 4,
+#         "emergency_callouts_enabled": true, "emergency_callout_fee": 5 }
+# ---------------------------------------------------------------------------
+@api_view(['PATCH'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_settings_update_availability(request):
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    settings_obj = _get_or_create_settings(professional)
+    payload = request.data
+
+    from datetime import datetime
+    if "working_hours_start" in payload:
+        settings_obj.working_hours_start = datetime.strptime(payload["working_hours_start"], "%H:%M").time()
+    if "working_hours_end" in payload:
+        settings_obj.working_hours_end = datetime.strptime(payload["working_hours_end"], "%H:%M").time()
+    if "working_days" in payload:
+        settings_obj.working_days = payload["working_days"]
+    if "max_jobs_per_day" in payload:
+        settings_obj.max_jobs_per_day = int(payload["max_jobs_per_day"])
+    if "emergency_callouts_enabled" in payload:
+        settings_obj.emergency_callouts_enabled = bool(payload["emergency_callouts_enabled"])
+    if "emergency_callout_fee" in payload:
+        settings_obj.emergency_callout_fee = payload["emergency_callout_fee"]
+    settings_obj.save()
+
+    return Response({"status": "success", "message": "Availability updated."})
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/professionals/vendor/settings/online-status/
+# Body: { "is_online": true }
+# ---------------------------------------------------------------------------
+@api_view(['PATCH'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_toggle_online_status(request):
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    settings_obj = _get_or_create_settings(professional)
+    settings_obj.is_online = bool(request.data.get("is_online", True))
+    settings_obj.save(update_fields=["is_online"])
+
+    return Response({
+        "status": "success",
+        "message": f"You are now {'online' if settings_obj.is_online else 'offline'}.",
+        "is_online": settings_obj.is_online,
+    })
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/professionals/vendor/settings/notifications/
+# Body: { "new_booking_alert": true, "payment_received": false, ... }
+# ---------------------------------------------------------------------------
+@api_view(['PATCH'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def vendor_settings_update_notifications(request):
+    try:
+        professional = Professional.objects.get(user=request.user)
+    except Professional.DoesNotExist:
+        return Response({"status": "error", "message": "Professional profile not found."}, status=404)
+
+    settings_obj = _get_or_create_settings(professional)
+    payload = request.data
+
+    field_map = {
+        "new_booking_alert": "notify_new_booking",
+        "payment_received": "notify_payment_received",
+        "review_posted": "notify_review_posted",
+        "credits_low_warning": "notify_credits_low",
+        "weekly_earnings": "notify_weekly_earnings",
+        "ai_tips": "notify_ai_tips",
+    }
+    for key, model_field in field_map.items():
+        if key in payload:
+            setattr(settings_obj, model_field, bool(payload[key]))
+    settings_obj.save()
+
+    return Response({"status": "success", "message": "Notification preferences updated."})
+
+
+def _serialize_config(config):
+    return {
+        "platform_commission_pct": float(config.platform_commission_pct),
+        "vat_rate_pct": float(config.vat_rate_pct),
+        "payout_cycle": config.payout_cycle,
+        "currency": config.currency,
+        "currency_label": f"{config.currency} ({config.currency_decimals} decimals)",
+        "default_language": config.default_languages,
+        "auto_routing_ai": config.auto_routing_ai_enabled,
+        "ai_moderation": config.ai_moderation_enabled,
+        "max_jobs_per_vendor_per_day": config.max_jobs_per_vendor_per_day,
+    }
+
+
+def _serialize_gateway(g):
+    return {
+        "id": g.id, "name": g.name, "description": g.description,
+        "status": g.status, "status_display": g.get_status_display(),
+        "is_primary": g.is_primary,
+    }
+
+
+def _serialize_integration(i):
+    return {
+        "id": i.id, "name": i.name, "description": i.description,
+        "status": i.status, "status_display": i.get_status_display(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET  /api/platform-settings/
+# PATCH /api/platform-settings/
+# ---------------------------------------------------------------------------
+@api_view(['GET', 'PATCH'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])  # add IsAdminUser in production
+def platform_config_view(request):
+    config = PlatformConfig.get_solo()
+
+    if request.method == 'GET':
+        gateways = PaymentGateway.objects.all()
+        integrations = Integration.objects.all()
+        return Response({
+            "status": "success",
+            "data": {
+                "platform_config": _serialize_config(config),
+                "payment_gateways": [_serialize_gateway(g) for g in gateways],
+                "integrations": [_serialize_integration(i) for i in integrations],
+            },
+        })
+
+    payload = request.data
+    field_map = {
+        "platform_commission_pct": "platform_commission_pct",
+        "vat_rate_pct": "vat_rate_pct",
+        "payout_cycle": "payout_cycle",
+        "currency": "currency",
+        "currency_decimals": "currency_decimals",
+        "default_language": "default_languages",
+        "auto_routing_ai": "auto_routing_ai_enabled",
+        "ai_moderation": "ai_moderation_enabled",
+        "max_jobs_per_vendor_per_day": "max_jobs_per_vendor_per_day",
+    }
+    for key, model_field in field_map.items():
+        if key in payload:
+            setattr(config, model_field, payload[key])
+    config.save()
+
+    return Response({
+        "status": "success",
+        "message": "Platform configuration updated.",
+        "data": _serialize_config(config),
+    })
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/platform-settings/payment-gateways/<id>/
+# Body: { "status": "live" }
+# ---------------------------------------------------------------------------
+@api_view(['PATCH'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def toggle_payment_gateway(request, pk):
+    try:
+        gateway = PaymentGateway.objects.get(pk=pk)
+    except PaymentGateway.DoesNotExist:
+        return Response({"status": "error", "message": "Payment gateway not found."}, status=404)
+
+    status_value = request.data.get("status")
+    if status_value not in dict(PaymentGateway.STATUS_CHOICES):
+        return Response({"status": "error", "message": "Invalid status."}, status=400)
+
+    gateway.status = status_value
+    gateway.save(update_fields=["status"])
+
+    return Response({
+        "status": "success",
+        "message": f"{gateway.name} is now {gateway.get_status_display()}.",
+        "data": _serialize_gateway(gateway),
+    })
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/platform-settings/integrations/<id>/
+# Body: { "status": "live" }
+# ---------------------------------------------------------------------------
+@api_view(['PATCH'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def toggle_integration(request, pk):
+    try:
+        integration = Integration.objects.get(pk=pk)
+    except Integration.DoesNotExist:
+        return Response({"status": "error", "message": "Integration not found."}, status=404)
+
+    status_value = request.data.get("status")
+    if status_value not in dict(Integration.STATUS_CHOICES):
+        return Response({"status": "error", "message": "Invalid status."}, status=400)
+
+    integration.status = status_value
+    integration.save(update_fields=["status"])
+
+    return Response({
+        "status": "success",
+        "message": f"{integration.name} is now {integration.get_status_display()}.",
+        "data": _serialize_integration(integration),
     })
