@@ -54,6 +54,7 @@ from .views import (
     vendor_credits,
     vendor_upgrade_plan,
     admin_adjust_credits,
+    admin_live_map,
 )
 
 from .views import (
@@ -246,6 +247,8 @@ path("admin/credits/adjust/",       admin_adjust_credits, name="admin_adjust_cre
     path("admin/credits-plans/", admin_credits_plans_summary, name="admin_credits_plans_summary"),
     path("admin/credits-plans/<int:professional_id>/", admin_vendor_credit_detail, name="admin_vendor_credit_detail"),
     path("admin/credits-plans/grant/", admin_grant_credits, name="admin_grant_credits"),
+    path("admin/live-map/", admin_live_map, name="admin_live_map"),
+
 ]
 
 

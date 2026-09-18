@@ -5687,3 +5687,157 @@ def admin_grant_credits(request):
         },
     })
  
+
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_live_map(request):
+    """
+    Supplies all live map coordinates, stats, and area coverage breakdowns
+    for the Admin Live Map dashboard.
+    """
+    area_filter = request.GET.get("area", "").strip()
+    service_id = request.GET.get("service_id")
+
+    # 1. Base QuerySets
+    all_pros = Professional.objects.filter(is_active=True)
+    online_pros = all_pros.filter(settings__is_online=True)
+
+    # Active bookings = anything ongoing or scheduled/pending not yet finished/cancelled
+    active_bookings = Booking.objects.exclude(
+        status__in=[Booking.STATUS_COMPLETED, Booking.STATUS_CANCELLED]
+    ).select_related("professional", "service_type", "service_type__service")
+
+    # 2. Filters
+    filtered_pros = online_pros
+    filtered_bookings = active_bookings
+
+    if area_filter:
+        filtered_pros = filtered_pros.filter(service_areas__area__iexact=area_filter).distinct()
+        filtered_bookings = filtered_bookings.filter(area__iexact=area_filter)
+
+    if service_id:
+        filtered_pros = filtered_pros.filter(offerings__service_type__service_id=service_id).distinct()
+        filtered_bookings = filtered_bookings.filter(service_type__service_id=service_id)
+
+    # 3. Live Stats (Sidebar Card 1)
+    total_vendors = all_pros.count()
+    online_vendors_count = online_pros.count()
+    active_bookings_count = active_bookings.count()
+    unassigned_count = active_bookings.filter(professional__isnull=True).count()
+
+    # Calculate average ETA across all online professionals
+    avg_eta_val = online_pros.aggregate(avg_eta=Avg("avg_arrival_minutes"))["avg_eta"]
+    avg_eta = round(avg_eta_val) if avg_eta_val else 14
+
+    stats = {
+        "online_vendors_count": online_vendors_count,
+        "total_vendors_count": total_vendors,
+        "online_vendors_label": f"{online_vendors_count} of {total_vendors}",
+        "active_bookings": active_bookings_count,
+        "unassigned_bookings": unassigned_count,
+        "avg_eta_minutes": avg_eta,
+        "avg_eta_label": f"{avg_eta} min",
+    }
+
+    # 4. Map Pins
+    SERVICE_ICONS = {
+        "AC Service": "snowflake",
+        "Cleaning": "broom",
+        "Plumbing": "wrench",
+        "Electrical": "bolt",
+        "Beauty": "sparkles",
+    }
+
+    pins = []
+
+    # Vendor Pins (Purple)
+    for pro in filtered_pros.select_related("location", "settings"):
+        loc = getattr(pro, "location", None)
+        lat = float(loc.latitude) if (loc and loc.latitude) else (float(pro.latitude) if pro.latitude else None)
+        lng = float(loc.longitude) if (loc and loc.longitude) else (float(pro.longitude) if pro.longitude else None)
+
+        if lat is not None and lng is not None:
+            pins.append({
+                "id": f"vendor-{pro.id}",
+                "type": "vendor_online",
+                "marker_color": "purple",
+                "professional_id": pro.id,
+                "name": pro.name,
+                "specialty": pro.specialty,
+                "icon": SERVICE_ICONS.get(pro.specialty, "user"),
+                "latitude": lat,
+                "longitude": lng,
+                "area": loc.area_label if (loc and loc.area_label) else pro.area,
+            })
+
+    # Booking Pins (Orange = Unassigned, Blue = Assigned)
+    for b in filtered_bookings:
+        if b.latitude is not None and b.longitude is not None:
+            is_unassigned = b.professional_id is None
+            service_name = b.service_type.service.name if (b.service_type and b.service_type.service) else ""
+
+            pins.append({
+                "id": f"booking-{b.id}",
+                "type": "unassigned_booking" if is_unassigned else "assigned_booking",
+                "marker_color": "orange" if is_unassigned else "blue",
+                "booking_id": b.id,
+                "booking_code": b.booking_code,
+                "service_name": b.service_type.type_name if b.service_type else "",
+                "icon": SERVICE_ICONS.get(service_name, "briefcase"),
+                "customer_name": b.user_name,
+                "professional_name": b.professional.name if b.professional else None,
+                "status": b.status,
+                "latitude": float(b.latitude),
+                "longitude": float(b.longitude),
+                "area": b.area,
+            })
+
+    # 5. Area Coverage Breakdown (Sidebar Card 2)
+    # Counts online vendors per area
+    all_known_areas = (
+        ProfessionalArea.objects.values_list("area", flat=True)
+        .union(Booking.objects.values_list("area", flat=True))
+    )
+    unique_areas = sorted(set(filter(None, all_known_areas)))
+
+    coverage = []
+    for area_name in unique_areas:
+        count = online_pros.filter(service_areas__area__iexact=area_name).distinct().count()
+
+        # Determine health status badge
+        if count >= 7:
+            status_label, badge_color = "Strong", "green"
+        elif count >= 4:
+            status_label, badge_color = "Good", "blue"
+        elif count >= 3:
+            status_label, badge_color = "OK", "yellow"
+        else:
+            status_label, badge_color = "Weak ⚠️", "red"
+
+        coverage.append({
+            "area": area_name,
+            "vendor_count": count,
+            "vendor_label": f"{count} vendor{'s' if count != 1 else ''}",
+            "status": status_label,
+            "badge_color": badge_color,
+        })
+
+    coverage.sort(key=lambda x: -x["vendor_count"])
+
+    return Response({
+        "status": "success",
+        "header": {
+            "online_vendors_badge": f"{online_vendors_count} vendors online",
+            "is_live": True,
+        },
+        "stats": stats,
+        "area_coverage": coverage,
+        "pins_count": len(pins),
+        "pins": pins,
+        "legend": [
+            {"label": "Vendor online", "color": "purple"},
+            {"label": "Unassigned booking", "color": "orange"},
+            {"label": "Assigned booking", "color": "blue"},
+        ],
+    })
