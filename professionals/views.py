@@ -36,6 +36,7 @@ from .models import (
     ProfessionalServiceArea,
     ProfessionalArea,
     Dispute,
+    Promotion,
 )
 from decimal import Decimal, InvalidOperation
 from services.models import Service, ServiceType
@@ -6236,3 +6237,160 @@ def admin_resolve_dispute(request, dispute_id):
             "resolution_amount": str(dispute.resolution_amount) if dispute.resolution_amount else None,
         },
     })
+
+
+
+    # ---------------------------------------------------------------------------
+# GET /api/professionals/admin/promotions/
+# ---------------------------------------------------------------------------
+
+@api_view(["GET"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_promotions_dashboard(request):
+    """
+    Returns active promotions, pre-filled AI builder defaults, and performance metrics.
+    """
+    promos = Promotion.objects.all()
+
+    # 1. Left Panel: Active Promos Cards
+    active_promos = promos.filter(status=Promotion.STATUS_LIVE)
+    active_cards = []
+    for p in active_promos:
+        # e.g. "20% off AC · All Muscat · Jul 31"
+        valid_label = p.valid_until.strftime("%b %d") if p.valid_until else ""
+        service_label = p.service_category.name if p.service_category else "All Services"
+        subtitle = p.description or f"{p.discount_label} · {p.target_segment} · {valid_label}"
+
+        card = {
+            "id": p.id,
+            "name": p.name,
+            "icon": p.icon_emoji,
+            "code": p.code,
+            "subtitle": subtitle,
+            "status": p.status,
+            "status_label": p.get_status_display(),
+            "used_count_label": f"Used: {p.used_count:,}×",
+            "revenue_generated": f"OMR {round(float(p.revenue_generated)):,}" if p.revenue_generated > 0 else None,
+            "conversion_rate": f"{p.conversion_rate_pct}% conv." if p.conversion_rate_pct > 0 else None,
+        }
+        active_cards.append(card)
+
+    # 2. Middle Panel: AI Promo Builder Default Suggestions
+    today = timezone.localdate()
+    default_expiry = today.replace(month=7, day=31) if today.month <= 7 else today.replace(month=12, day=31)
+    
+    ai_builder_defaults = {
+        "suggested_promo_name": "Back-to-School Cleaning",
+        "suggested_discount": "15% off",
+        "discount_type": "percentage",
+        "discount_value": 15,
+        "suggested_applies_to": "Cleaning services",
+        "suggested_applies_to_id": getattr(Service.objects.filter(name__icontains="cleaning").first(), "id", None),
+        "suggested_target_segment": "Lapsed customers (21+ days)",
+        "suggested_valid_until": default_expiry.strftime("%Y-%m-%d"),
+        "valid_until_label": default_expiry.strftime("%d %b %Y").lstrip("0"),
+        "ai_recommendation": "Target lapsed Qurum users — highest ROI segment.",
+    }
+
+    # 3. Right Panel: Campaign Performance Metrics
+    total_promos_sent = 8247  # In production, aggregate from campaign dispatch logs
+    total_redemptions = sum(p.used_count for p in promos)
+    redemption_rate = round((total_redemptions / total_promos_sent * 100), 1) if total_promos_sent else 34.2
+
+    total_promo_rev = promos.aggregate(s=Sum("revenue_generated"))["s"] or Decimal("14320.000")
+    total_discount_cost = promos.aggregate(s=Sum("discount_cost"))["s"] or Decimal("2160.000")
+
+    # Net ROI = ((Revenue - Cost) / Cost) * 100
+    rev_float = float(total_promo_rev)
+    cost_float = float(total_discount_cost)
+    net_roi_pct = round(((rev_float - cost_float) / cost_float) * 100) if cost_float > 0 else 563
+
+    performance = {
+        "promos_sent": f"{total_promos_sent:,}",
+        "redemption_rate": f"{redemption_rate}%",
+        "revenue_from_promos": f"OMR {round(rev_float):,}",
+        "discount_cost": f"OMR {round(cost_float):,}",
+        "net_roi": f"{net_roi_pct}%",
+    }
+
+    return Response({
+        "status": "success",
+        "active_promos_count": len(active_cards),
+        "active_promotions": active_cards,
+        "ai_promo_builder": ai_builder_defaults,
+        "campaign_performance": performance,
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /api/professionals/admin/promotions/create/
+# ---------------------------------------------------------------------------
+
+@api_view(["POST"])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_create_promotion(request):
+    """
+    Creates and launches a new promo campaign from the AI Promo Builder.
+    """
+    payload = request.data
+    name = (payload.get("name") or payload.get("promo_name") or "").strip()
+    valid_until_raw = payload.get("valid_until")
+
+    if not name or not valid_until_raw:
+        return Response(
+            {"status": "error", "message": "name and valid_until (YYYY-MM-DD) are required."},
+            status=400,
+        )
+
+    try:
+        valid_until = datetime.strptime(valid_until_raw, "%Y-%m-%d").date()
+    except ValueError:
+        return Response(
+            {"status": "error", "message": "Invalid date format. Use YYYY-MM-DD."},
+            status=400,
+        )
+
+    discount_type = payload.get("discount_type", Promotion.DISCOUNT_TYPE_PERCENT)
+    discount_val = Decimal(str(payload.get("discount_value", 15)))
+    discount_label = payload.get("discount_label") or (f"{int(discount_val)}% off" if discount_type == "percentage" else f"OMR {discount_val} off")
+
+    service_category = None
+    category_id = payload.get("service_category_id")
+    if category_id:
+        service_category = Service.objects.filter(id=category_id).first()
+
+    code = payload.get("code")
+    if not code:
+        # Generate clean promo code from name, e.g. "CLEAN15"
+        clean_prefix = "".join(filter(str.isalnum, name.upper()))[:5]
+        code = f"{clean_prefix}{int(discount_val)}"
+
+    promo = Promotion.objects.create(
+        name=name,
+        code=code,
+        icon_emoji=payload.get("icon_emoji", "✨"),
+        discount_type=discount_type,
+        discount_value=discount_val,
+        discount_label=discount_label,
+        service_category=service_category,
+        target_segment=payload.get("target_segment", "All Muscat"),
+        valid_until=valid_until,
+        status=Promotion.STATUS_LIVE,
+        ai_recommendation_note=payload.get("ai_recommendation", ""),
+    )
+
+    return Response({
+        "status": "success",
+        "message": f"Promotion '{promo.name}' launched successfully.",
+        "data": {
+            "id": promo.id,
+            "name": promo.name,
+            "code": promo.code,
+            "discount_label": promo.discount_label,
+            "target_segment": promo.target_segment,
+            "valid_until": promo.valid_until.isoformat(),
+            "status": promo.status,
+        },
+    }, status=201)

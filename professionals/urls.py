@@ -79,6 +79,7 @@ from .views import (
     admin_vendor_credit_detail,
     admin_grant_credits,
     admin_disputes_list, admin_resolve_dispute,
+    admin_promotions_dashboard, admin_create_promotion,
 )
 
 urlpatterns = [
@@ -251,6 +252,8 @@ path("admin/credits/adjust/",       admin_adjust_credits, name="admin_adjust_cre
     path("admin/live-map/", admin_live_map, name="admin_live_map"),
     path("admin/disputes/", admin_disputes_list, name="admin_disputes_list"),
     path("admin/disputes/<int:dispute_id>/resolve/", admin_resolve_dispute, name="admin_resolve_dispute"),
+    path("admin/promotions/", admin_promotions_dashboard, name="admin_promotions_dashboard"),
+    path("admin/promotions/create/", admin_create_promotion, name="admin_create_promotion"),
 ]
 
 

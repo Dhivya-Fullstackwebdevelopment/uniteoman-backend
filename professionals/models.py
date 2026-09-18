@@ -603,8 +603,6 @@ class VendorVerification(models.Model):
     def __str__(self):
         return f"{self.professional.name} — {self.status}"
 
-
-
 class Dispute(models.Model):
     STATUS_OPEN = "open"
     STATUS_IN_REVIEW = "in_review"
@@ -654,3 +652,54 @@ class Dispute(models.Model):
 
     def __str__(self):
         return f"{self.dispute_code} - {self.title}"
+
+
+class Promotion(models.Model):
+    DISCOUNT_TYPE_PERCENT = "percentage"
+    DISCOUNT_TYPE_FIXED = "fixed"
+    DISCOUNT_TYPE_CHOICES = [
+        (DISCOUNT_TYPE_PERCENT, "Percentage Off"),
+        (DISCOUNT_TYPE_FIXED, "Fixed Amount Off"),
+    ]
+
+    STATUS_DRAFT = "draft"
+    STATUS_LIVE = "live"
+    STATUS_EXPIRED = "expired"
+    STATUS_PAUSED = "paused"
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, "Draft"),
+        (STATUS_LIVE, "Live"),
+        (STATUS_EXPIRED, "Expired"),
+        (STATUS_PAUSED, "Paused"),
+    ]
+
+    name = models.CharField(max_length=150)  # e.g., "Summer AC Deal", "Back-to-School Cleaning"
+    code = models.CharField(max_length=50, unique=True, blank=True, null=True)  # e.g., "WELCOME5"
+    description = models.CharField(max_length=255, blank=True)
+    icon_emoji = models.CharField(max_length=10, default="🏷️")  # e.g., "☀️", "🎟️"
+
+    discount_type = models.CharField(max_length=20, choices=DISCOUNT_TYPE_CHOICES, default=DISCOUNT_TYPE_PERCENT)
+    discount_value = models.DecimalField(max_digits=10, decimal_places=2)  # 15.00 for 15% or 5.00 for OMR 5
+    discount_label = models.CharField(max_length=50, blank=True)  # "15% off" or "OMR 5 off"
+
+    service_category = models.ForeignKey(
+        Service, on_delete=models.SET_NULL, null=True, blank=True, related_name="promotions"
+    )
+    target_segment = models.CharField(max_length=150, default="All Muscat")  # "Lapsed customers (21+ days)"
+    valid_until = models.DateField()
+
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_LIVE)
+    used_count = models.PositiveIntegerField(default=0)
+    conversion_rate_pct = models.PositiveIntegerField(default=0)  # e.g., 89 for "89% conv."
+    revenue_generated = models.DecimalField(max_digits=12, decimal_places=3, default=0.000)
+    discount_cost = models.DecimalField(max_digits=12, decimal_places=3, default=0.000)
+
+    ai_recommendation_note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.name} [{self.status}]"
