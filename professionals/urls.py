@@ -73,6 +73,11 @@ from .views import (
     admin_vendor_verification_request_docs,
     admin_vendor_verification_contact,
 )
+from .views import (
+    admin_credits_plans_summary,
+    admin_vendor_credit_detail,
+    admin_grant_credits,
+)
 
 urlpatterns = [
     # Professional List + Filters
@@ -237,6 +242,10 @@ path("admin/credits/adjust/",       admin_adjust_credits, name="admin_adjust_cre
     path("admin/vendor-verification/<int:professional_id>/reject/", admin_vendor_verification_reject, name="admin_vendor_verification_reject"),
     path("admin/vendor-verification/<int:professional_id>/request-docs/", admin_vendor_verification_request_docs, name="admin_vendor_verification_request_docs"),
     path("admin/vendor-verification/<int:professional_id>/contact/", admin_vendor_verification_contact, name="admin_vendor_verification_contact"),
+
+    path("admin/credits-plans/", admin_credits_plans_summary, name="admin_credits_plans_summary"),
+    path("admin/credits-plans/<int:professional_id>/", admin_vendor_credit_detail, name="admin_vendor_credit_detail"),
+    path("admin/credits-plans/grant/", admin_grant_credits, name="admin_grant_credits"),
 ]
 
 

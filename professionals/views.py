@@ -5495,3 +5495,195 @@ def admin_vendor_verification_contact(request, professional_id):
         "data": {"professional_id": professional.id, "message_sent": message},
     })
  
+
+
+
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])  # swap for IsAdminUser in production
+def admin_credits_plans_summary(request):
+    subs = VendorSubscription.objects.select_related("professional", "plan").all()
+ 
+    # ── KPI: Active Plans ────────────────────────────────────────────────
+    active_plans_count = subs.count()
+ 
+    # ── KPI: Credits Revenue (monthly, derived from each vendor's plan price) ──
+    credits_revenue = sum(float(s.plan.price_omr or 0) for s in subs)
+ 
+    # ── KPI: Credits Issued / Used this cycle ──────────────────────────────
+    credits_issued = sum((s.credits + s.credits_used) for s in subs)
+    credits_used = sum(s.credits_used for s in subs)
+    usage_rate_pct = round((credits_used / credits_issued) * 100) if credits_issued else 0
+ 
+    # ── Plan Distribution ────────────────────────────────────────────────
+    plan_rows = (
+        SubscriptionPlan.objects.filter(is_active=True).order_by("price_omr")
+    )
+    plan_distribution = []
+    for plan in plan_rows:
+        vendor_count = subs.filter(plan=plan).count()
+        revenue = round(vendor_count * float(plan.price_omr or 0), 3)
+        plan_distribution.append({
+            "plan_id": plan.id,
+            "plan_name": plan.name.capitalize(),
+            "price_label": f"{plan.name.capitalize()} (OMR {int(plan.price_omr)})" if plan.price_omr else plan.name.capitalize(),
+            "vendor_count": vendor_count,
+            "vendor_count_label": f"{vendor_count} vendors",
+            "revenue": revenue,
+            "revenue_label": f"OMR {revenue:g}",
+        })
+ 
+    # ── Vendor Credit Status ────────────────────────────────────────────
+    vendor_credit_status = []
+    for s in subs.order_by("-credits")[:50]:  # cap list, add pagination later if needed
+        is_blocked = s.credits <= 0
+        vendor_credit_status.append({
+            "professional_id": s.professional_id,
+            "vendor_name": s.professional.name,
+            "plan_name": s.plan.name.capitalize(),
+            "credits": s.credits,
+            "credits_label": f"{s.credits} credits" if not is_blocked else "0 credits — Blocked",
+            "is_blocked": is_blocked,
+        })
+ 
+    return Response({
+        "status": "success",
+        "kpis": {
+            "active_plans": {
+                "value": active_plans_count,
+                "subtitle": "This month",
+            },
+            "credits_revenue": {
+                "value": round(credits_revenue, 3),
+                "value_label": f"OMR {round(credits_revenue):,}",
+                "currency": "OMR",
+                "subtitle": "Monthly",
+            },
+            "credits_issued": {
+                "value": credits_issued,
+                "subtitle": "This month",
+            },
+            "credits_used": {
+                "value": credits_used,
+                "usage_rate_pct": usage_rate_pct,
+                "subtitle": f"{usage_rate_pct}% usage rate",
+            },
+        },
+        "plan_distribution": plan_distribution,
+        "vendor_credit_status": vendor_credit_status,
+    })
+ 
+ 
+# ---------------------------------------------------------------------------
+# GET /api/professionals/admin/credits-plans/<professional_id>/
+# "Manage" button — full credit detail + transaction history for one vendor
+# ---------------------------------------------------------------------------
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_vendor_credit_detail(request, professional_id):
+    professional = get_object_or_404(Professional, pk=professional_id)
+ 
+    try:
+        sub = professional.subscription
+    except VendorSubscription.DoesNotExist:
+        return Response({
+            "status": "error",
+            "message": "This vendor has no subscription yet.",
+        }, status=404)
+ 
+    txns = CreditTransaction.objects.filter(professional=professional).order_by("-created_at")[:20]
+ 
+    return Response({
+        "status": "success",
+        "data": {
+            "professional_id": professional.id,
+            "vendor_name": professional.name,
+            "plan_name": sub.plan.name.capitalize(),
+            "credits": sub.credits,
+            "credits_used": sub.credits_used,
+            "is_blocked": sub.credits <= 0,
+            "renews_at": sub.renews_at.strftime("%d %b %Y").lstrip("0") if sub.renews_at else None,
+            "recent_transactions": [
+                {
+                    "id": t.id,
+                    "delta": t.delta,
+                    "delta_label": f"{'+' if t.delta >= 0 else ''}{t.delta}",
+                    "reason": t.get_reason_display(),
+                    "note": t.note,
+                    "date_label": t.created_at.strftime("%d %b %Y").lstrip("0"),
+                }
+                for t in txns
+            ],
+        },
+    })
+ 
+ 
+# ---------------------------------------------------------------------------
+# POST /api/professionals/admin/credits-plans/grant/
+# "Grant Credits" button (top-right) and per-row "Manage" adjust action.
+# Body: { "professional_id": 5, "delta": 50, "note": "Manual top-up by admin" }
+# Positive delta = grant, negative delta = deduct.
+# ---------------------------------------------------------------------------
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_grant_credits(request):
+    professional_id = request.data.get("professional_id")
+    delta = request.data.get("delta")
+    note = (request.data.get("note") or "").strip()
+ 
+    if professional_id is None or delta is None:
+        return Response({
+            "status": "error",
+            "message": "professional_id and delta are required.",
+        }, status=400)
+ 
+    try:
+        delta = int(delta)
+    except (TypeError, ValueError):
+        return Response({"status": "error", "message": "delta must be an integer."}, status=400)
+ 
+    if delta == 0:
+        return Response({"status": "error", "message": "delta cannot be 0."}, status=400)
+ 
+    professional = get_object_or_404(Professional, pk=professional_id)
+ 
+    try:
+        sub = professional.subscription
+    except VendorSubscription.DoesNotExist:
+        return Response({
+            "status": "error",
+            "message": "This vendor has no subscription yet.",
+        }, status=400)
+ 
+    if delta < 0 and sub.credits + delta < 0:
+        return Response({
+            "status": "error",
+            "message": f"Insufficient credits. Balance: {sub.credits}, attempted deduction: {abs(delta)}.",
+        }, status=400)
+ 
+    sub.credits += delta
+    if delta < 0:
+        sub.credits_used += abs(delta)
+    sub.save(update_fields=["credits", "credits_used", "updated_at"])
+ 
+    reason = CreditTransaction.REASON_MANUAL_TOPUP if delta > 0 else CreditTransaction.REASON_ADMIN_BONUS
+    CreditTransaction.objects.create(
+        professional=professional,
+        delta=delta,
+        reason=reason,
+        note=note or ("Admin granted credits" if delta > 0 else "Admin deducted credits"),
+    )
+ 
+    return Response({
+        "status": "success",
+        "message": f"{'Granted' if delta > 0 else 'Deducted'} {abs(delta)} credits {'to' if delta > 0 else 'from'} {professional.name}. New balance: {sub.credits}.",
+        "data": {
+            "professional_id": professional.id,
+            "vendor_name": professional.name,
+            "new_balance": sub.credits,
+            "is_blocked": sub.credits <= 0,
+        },
+    })
+ 
