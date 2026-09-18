@@ -602,3 +602,55 @@ class VendorVerification(models.Model):
 
     def __str__(self):
         return f"{self.professional.name} — {self.status}"
+
+
+
+class Dispute(models.Model):
+    STATUS_OPEN = "open"
+    STATUS_IN_REVIEW = "in_review"
+    STATUS_ESCALATED = "escalated"
+    STATUS_RESOLVED = "resolved"
+    STATUS_CLOSED = "closed"
+
+    STATUS_CHOICES = [
+        (STATUS_OPEN, "Open"),
+        (STATUS_IN_REVIEW, "In Review"),
+        (STATUS_ESCALATED, "Escalated"),
+        (STATUS_RESOLVED, "Resolved"),
+        (STATUS_CLOSED, "Closed"),
+    ]
+
+    AI_RISK_CHOICES = [
+        ("high", "High Risk"),
+        ("medium", "Medium Risk"),
+        ("low", "Low Risk"),
+        ("auto_resolved", "Auto-resolved"),
+    ]
+
+    dispute_code = models.CharField(max_length=20, unique=True)  # e.g., "#D-006"
+    booking = models.ForeignKey(
+        Booking, on_delete=models.CASCADE, related_name="disputes"
+    )
+    professional = models.ForeignKey(
+        Professional, on_delete=models.SET_NULL, null=True, blank=True, related_name="disputes"
+    )
+    customer_name = models.CharField(max_length=150)
+    title = models.CharField(max_length=255)  # e.g., "Pro did not show — 3rd complaint vs Khalid K."
+    description = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_OPEN)
+    ai_risk = models.CharField(max_length=20, choices=AI_RISK_CHOICES, blank=True, null=True)
+    is_auto_resolved = models.BooleanField(default=False)
+
+    resolution_action = models.CharField(max_length=50, blank=True, null=True)
+    resolution_amount = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+    admin_notes = models.TextField(blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.dispute_code} - {self.title}"
