@@ -1,5 +1,10 @@
 from django.contrib import admin
 from .models import Professional, ProfessionalServiceType, Review, Booking
+from .models import (
+    PaymentGateway, Integration, PlatformConfig,
+    Professional, Booking, Review
+)
+
 
 @admin.register(Professional)
 class ProfessionalAdmin(admin.ModelAdmin):
@@ -25,3 +30,15 @@ class BookingAdmin(admin.ModelAdmin):
     list_filter = ('status', 'payment_method', 'booking_date')
     search_fields = ('booking_code', 'user_name', 'user_email', 'user_mobile')
     readonly_fields = ('booking_code', 'created_at', 'updated_at')
+
+@admin.register(PaymentGateway)
+class PaymentGatewayAdmin(admin.ModelAdmin):
+    list_display = ['name', 'description', 'status', 'is_primary', 'sort_order']
+
+@admin.register(Integration)
+class IntegrationAdmin(admin.ModelAdmin):
+    list_display = ['name', 'description', 'status', 'sort_order']
+
+@admin.register(PlatformConfig)
+class PlatformConfigAdmin(admin.ModelAdmin):
+    list_display = ['currency', 'platform_commission_pct', 'vat_rate_pct']

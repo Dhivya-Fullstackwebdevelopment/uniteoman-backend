@@ -64,7 +64,7 @@ from .views import (
     vendor_settings_update_notifications,
 )
 from .views import platform_config_view, toggle_payment_gateway, toggle_integration
-
+from professionals import views as pro_views
 
 urlpatterns = [
     # Professional List + Filters
@@ -218,6 +218,10 @@ path("admin/credits/adjust/",       admin_adjust_credits, name="admin_adjust_cre
 
     path("payment-gateways/<int:pk>/", toggle_payment_gateway, name="toggle_payment_gateway"),
     path("integrations/<int:pk>/", toggle_integration, name="toggle_integration"),
+
+    path("platform-settings/", pro_views.platform_config_view, name="platform_config"),
+    path("platform-settings/payment-gateways/<int:pk>/", pro_views.toggle_payment_gateway),
+    path("platform-settings/integrations/<int:pk>/", pro_views.toggle_integration),
 ]
 
 

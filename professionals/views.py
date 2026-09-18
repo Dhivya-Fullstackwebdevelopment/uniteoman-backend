@@ -5240,3 +5240,46 @@ def toggle_integration(request, pk):
         "message": f"{integration.name} is now {integration.get_status_display()}.",
         "data": _serialize_integration(integration),
     })
+
+
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])  # swap for IsAdminUser in production
+def admin_vendor_list(request):
+    """
+    Example: Admin - list all professionals with filters.
+    GET /api/professionals/admin/vendors/
+    """
+    qs = Professional.objects.all().select_related("governorate")
+
+    search = request.GET.get("search", "").strip()
+    if search:
+        qs = qs.filter(
+            Q(name__icontains=search) | Q(email__icontains=search)
+        )
+
+    is_active = request.GET.get("is_active")
+    if is_active is not None:
+        qs = qs.filter(is_active=is_active.lower() == "true")
+
+    data = [
+        {
+            "id": p.id,
+            "name": p.name,
+            "specialty": p.specialty,
+            "email": p.email,
+            "phone": p.phone,
+            "governorate": p.governorate.name if p.governorate else None,
+            "area": p.area,
+            "rating": float(p.rating),
+            "jobs_done": p.jobs_done,
+            "is_active": p.is_active,
+        }
+        for p in qs
+    ]
+
+    return Response({
+        "status": "success",
+        "count": len(data),
+        "data": data,
+    })
