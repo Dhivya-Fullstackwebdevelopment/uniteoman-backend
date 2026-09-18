@@ -65,6 +65,14 @@ from .views import (
 )
 from .views import platform_config_view, toggle_payment_gateway, toggle_integration
 from professionals import views as pro_views
+from .views import (
+    admin_vendor_verification_list,
+    admin_vendor_verification_profile,
+    admin_vendor_verification_approve,
+    admin_vendor_verification_reject,
+    admin_vendor_verification_request_docs,
+    admin_vendor_verification_contact,
+)
 
 urlpatterns = [
     # Professional List + Filters
@@ -222,6 +230,13 @@ path("admin/credits/adjust/",       admin_adjust_credits, name="admin_adjust_cre
     path("platform-settings/", pro_views.platform_config_view, name="platform_config"),
     path("platform-settings/payment-gateways/<int:pk>/", pro_views.toggle_payment_gateway),
     path("platform-settings/integrations/<int:pk>/", pro_views.toggle_integration),
+
+    path("admin/vendor-verification/", admin_vendor_verification_list, name="admin_vendor_verification_list"),
+    path("admin/vendor-verification/<int:professional_id>/profile/", admin_vendor_verification_profile, name="admin_vendor_verification_profile"),
+    path("admin/vendor-verification/<int:professional_id>/approve/", admin_vendor_verification_approve, name="admin_vendor_verification_approve"),
+    path("admin/vendor-verification/<int:professional_id>/reject/", admin_vendor_verification_reject, name="admin_vendor_verification_reject"),
+    path("admin/vendor-verification/<int:professional_id>/request-docs/", admin_vendor_verification_request_docs, name="admin_vendor_verification_request_docs"),
+    path("admin/vendor-verification/<int:professional_id>/contact/", admin_vendor_verification_contact, name="admin_vendor_verification_contact"),
 ]
 
 

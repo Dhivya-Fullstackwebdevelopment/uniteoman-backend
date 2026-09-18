@@ -545,3 +545,60 @@ class Integration(models.Model):
 
     def __str__(self):
         return self.name
+
+
+
+        # ── PASTE THIS AT THE VERY BOTTOM OF professionals/models.py ──────────────
+# (nothing else in models.py needs to change)
+
+class VendorVerification(models.Model):
+    """
+    Verification record shown on the Admin 'Vendor Verification' screen.
+    One row per Professional. Created lazily the first time it's viewed.
+    """
+    STATUS_PENDING = "pending"
+    STATUS_APPROVED = "approved"
+    STATUS_REJECTED = "rejected"
+    STATUS_DOCS_REQUESTED = "docs_requested"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_APPROVED, "Approved"),
+        (STATUS_REJECTED, "Rejected"),
+        (STATUS_DOCS_REQUESTED, "Docs Requested"),
+    ]
+
+    professional = models.OneToOneField(
+        Professional, on_delete=models.CASCADE, related_name="verification"
+    )
+
+    # Civil ID (ROP)
+    civil_id_number = models.CharField(max_length=50, blank=True)
+    civil_id_verified = models.BooleanField(default=False)
+
+    # VAT (shown for LLC / business vendors, e.g. "VAT: OM987654321")
+    vat_number = models.CharField(max_length=50, blank=True)
+
+    # Trade certification badge, e.g. "HVAC Certified" / "Cosmetology License"
+    certification_name = models.CharField(max_length=100, blank=True)
+    certification_verified = models.BooleanField(default=False)
+
+    years_experience = models.PositiveIntegerField(default=0)
+
+    # Documents (the blue pill links: "ID Copy", "Trade License", "HVAC Cert")
+    id_copy = models.FileField(upload_to="vendor_docs/id_copy/", blank=True, null=True)
+    trade_license_doc = models.FileField(upload_to="vendor_docs/trade_license/", blank=True, null=True)
+    certification_doc = models.FileField(upload_to="vendor_docs/certification/", blank=True, null=True)
+
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    admin_note = models.TextField(blank=True)
+    requested_docs_note = models.TextField(blank=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Vendor Verification"
+
+    def __str__(self):
+        return f"{self.professional.name} — {self.status}"

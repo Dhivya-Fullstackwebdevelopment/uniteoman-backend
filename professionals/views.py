@@ -56,6 +56,7 @@ from .models import (
     VendorSubscription, SubscriptionPlan, CreditTransaction, VendorLocation
 )
 from .models import PlatformConfig, PaymentGateway, Integration
+from .models import Professional, VendorVerification, VendorSettings
 
 
 User = get_user_model()
@@ -5283,3 +5284,214 @@ def admin_vendor_list(request):
         "count": len(data),
         "data": data,
     })
+
+
+    
+def _get_or_create_verification(professional):
+    verification, _ = VendorVerification.objects.get_or_create(professional=professional)
+    return verification
+ 
+ 
+def _serialize_vendor_card(v: VendorVerification, request=None):
+    pro = v.professional
+    settings_obj = VendorSettings.objects.filter(professional=pro).first()
+ 
+    badges = []
+    badges.append({
+        "label": f"CR: {settings_obj.cr_number} Active" if settings_obj and settings_obj.cr_number and settings_obj.cr_verified
+                  else (f"CR: {settings_obj.cr_number} Pending verification" if settings_obj and settings_obj.cr_number else "CR: Pending verification"),
+        "ok": bool(settings_obj and settings_obj.cr_verified),
+    })
+    badges.append({
+        "label": f"Civil ID: {v.civil_id_number} Verified" if v.civil_id_verified and v.civil_id_number
+                  else "Civil ID: Verified" if v.civil_id_verified else "Civil ID: Pending",
+        "ok": v.civil_id_verified,
+    })
+    badges.append({
+        "label": f"VAT: {v.vat_number}" if v.vat_number else "N/A",
+        "ok": bool(v.vat_number),
+    })
+    badges.append({
+        "label": f"{v.certification_name} ✓" if v.certification_verified and v.certification_name
+                  else (v.certification_name if v.certification_name else "None required"),
+        "ok": v.certification_verified,
+    })
+ 
+    documents = []
+    if v.id_copy:
+        documents.append({"label": "ID Copy", "url": request.build_absolute_uri(v.id_copy.url) if request else v.id_copy.url})
+    if v.trade_license_doc:
+        documents.append({"label": "Trade License", "url": request.build_absolute_uri(v.trade_license_doc.url) if request else v.trade_license_doc.url})
+    if v.certification_doc:
+        documents.append({"label": v.certification_name or "Certificate", "url": request.build_absolute_uri(v.certification_doc.url) if request else v.certification_doc.url})
+ 
+    business_type_label = "LLC" if settings_obj and settings_obj.business_type == "llc" else (
+        "Sole Proprietor" if settings_obj and settings_obj.business_type == "sole_proprietor" else "Individual"
+    )
+ 
+    return {
+        "professional_id": pro.id,
+        "verification_id": v.id,
+        "name": pro.name,
+        "initial": pro.name[0].upper() if pro.name else "",
+        "business_type": business_type_label,
+        "specialty": pro.specialty,
+        "years_experience": v.years_experience,
+        "subtitle": f"{business_type_label} · {pro.specialty} · {v.years_experience} yrs",
+        "badges": badges,
+        "documents": documents,
+        "status": v.status,
+        "status_display": v.get_status_display(),
+        "admin_note": v.admin_note,
+        "requested_docs_note": v.requested_docs_note,
+        "reviewed_at": v.reviewed_at.isoformat() if v.reviewed_at else None,
+    }
+ 
+ 
+# ---------------------------------------------------------------------------
+# GET /api/professionals/admin/vendor-verification/?status=pending
+# ---------------------------------------------------------------------------
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])  # swap for IsAdminUser in production
+def admin_vendor_verification_list(request):
+    status_filter = request.GET.get("status", "pending").lower()
+ 
+    qs = VendorVerification.objects.select_related("professional").all()
+ 
+    if status_filter and status_filter != "all":
+        qs = qs.filter(status=status_filter)
+ 
+    qs = qs.order_by("-created_at")
+ 
+    pending_count = VendorVerification.objects.filter(status=VendorVerification.STATUS_PENDING).count()
+    approved_count = VendorVerification.objects.filter(status=VendorVerification.STATUS_APPROVED).count()
+ 
+    data = [_serialize_vendor_card(v, request) for v in qs]
+ 
+    return Response({
+        "status": "success",
+        "pending_count": pending_count,
+        "approved_count": approved_count,
+        "count": len(data),
+        "data": data,
+    })
+ 
+ 
+# ---------------------------------------------------------------------------
+# GET /api/professionals/admin/vendor-verification/<professional_id>/profile/
+# "View Full Profile" button
+# ---------------------------------------------------------------------------
+@api_view(['GET'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_vendor_verification_profile(request, professional_id):
+    professional = get_object_or_404(Professional, pk=professional_id)
+    verification = _get_or_create_verification(professional)
+ 
+    return Response({
+        "status": "success",
+        "data": _serialize_vendor_card(verification, request),
+    })
+ 
+ 
+# ---------------------------------------------------------------------------
+# POST /api/professionals/admin/vendor-verification/<professional_id>/approve/
+# Body: { "admin_note": "optional" }
+# ---------------------------------------------------------------------------
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_vendor_verification_approve(request, professional_id):
+    professional = get_object_or_404(Professional, pk=professional_id)
+    verification = _get_or_create_verification(professional)
+ 
+    verification.status = VendorVerification.STATUS_APPROVED
+    verification.admin_note = (request.data.get("admin_note") or "").strip()
+    verification.reviewed_at = timezone.now()
+    verification.save(update_fields=["status", "admin_note", "reviewed_at", "updated_at"])
+ 
+    return Response({
+        "status": "success",
+        "message": f"{professional.name} approved.",
+        "data": _serialize_vendor_card(verification, request),
+    })
+ 
+ 
+# ---------------------------------------------------------------------------
+# POST /api/professionals/admin/vendor-verification/<professional_id>/reject/
+# Body: { "admin_note": "reason for rejection" }
+# ---------------------------------------------------------------------------
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_vendor_verification_reject(request, professional_id):
+    professional = get_object_or_404(Professional, pk=professional_id)
+    verification = _get_or_create_verification(professional)
+ 
+    admin_note = (request.data.get("admin_note") or "").strip()
+    if not admin_note:
+        return Response({
+            "status": "error",
+            "message": "admin_note is required when rejecting a vendor.",
+        }, status=400)
+ 
+    verification.status = VendorVerification.STATUS_REJECTED
+    verification.admin_note = admin_note
+    verification.reviewed_at = timezone.now()
+    verification.save(update_fields=["status", "admin_note", "reviewed_at", "updated_at"])
+ 
+    return Response({
+        "status": "success",
+        "message": f"{professional.name} rejected.",
+        "data": _serialize_vendor_card(verification, request),
+    })
+ 
+ 
+# ---------------------------------------------------------------------------
+# POST /api/professionals/admin/vendor-verification/<professional_id>/request-docs/
+# Body: { "requested_docs_note": "Please upload a valid Trade License" }
+# ---------------------------------------------------------------------------
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_vendor_verification_request_docs(request, professional_id):
+    professional = get_object_or_404(Professional, pk=professional_id)
+    verification = _get_or_create_verification(professional)
+ 
+    note = (request.data.get("requested_docs_note") or "").strip()
+    if not note:
+        return Response({
+            "status": "error",
+            "message": "requested_docs_note is required.",
+        }, status=400)
+ 
+    verification.status = VendorVerification.STATUS_DOCS_REQUESTED
+    verification.requested_docs_note = note
+    verification.save(update_fields=["status", "requested_docs_note", "updated_at"])
+ 
+    return Response({
+        "status": "success",
+        "message": f"Document request sent to {professional.name}.",
+        "data": _serialize_vendor_card(verification, request),
+    })
+ 
+ 
+# ---------------------------------------------------------------------------
+# POST /api/professionals/admin/vendor-verification/<professional_id>/contact/
+# "Contact Vendor" button — stub, wire to SMS/email later
+# ---------------------------------------------------------------------------
+@api_view(['POST'])
+@authentication_classes([JWTAuthentication])
+@permission_classes([IsAuthenticated])
+def admin_vendor_verification_contact(request, professional_id):
+    professional = get_object_or_404(Professional, pk=professional_id)
+    message = (request.data.get("message") or "").strip()
+ 
+    # placeholder: hook SMS/email/push service here later
+    return Response({
+        "status": "success",
+        "message": f"Message queued to {professional.name} ({professional.phone or professional.email or 'no contact'}).",
+        "data": {"professional_id": professional.id, "message_sent": message},
+    })
+ 
